@@ -1,0 +1,4 @@
+interface:
+  display_name: "Skill 维护规范"
+  short_description: "审查并规范 Skill 的文件分工、内容边界、引用关系和维护质量"
+  default_prompt: "请审查目标 Skill 的文件职责、重复内容、引用关系和内容粒度，并给出或执行符合维护规范的调整。"
