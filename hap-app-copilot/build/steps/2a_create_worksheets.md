@@ -1,134 +1,82 @@
-# Step 2a: 创建工作表与基础字段排版 SOP (2a_create_worksheets)
+# Step 2a: 单表创建、基础字段排版与表单增强 SOP (`2a_create_worksheets`)
 
-本文档是 Build 阶段 **Step 2a（按表并发创建工作表与基础字段）** 的专属作业指导书。
+<!-- SOURCE: build-app/worksheet-build-sub-agent.yaml -->
 
----
+## 一、 本地宿主输入与参考映射
 
-## 目录
-
-1. [执行定位与输入契约](#一-执行定位与输入契约)
-2. [引用的平台规格 (SSOT)](#二-引用的平台规格-ssot)
-3. [单表执行 SOP 流水线](#三-单表执行-sop-流水线)
-4. [输出交付物契约 (.build)](#四-输出交付物契约-build)
-5. [⛔ 验证断言与错误自愈](#五-⛔-验证断言与错误自愈)
-
----
-
-## 一、 执行定位与输入契约
-
-- **执行方式**：子代理按表并发；
-- **任务目标**：根据 `hap-plan.json` 创建 1 张工作表，并一次性注入该表的 **基础字段（非关联/非公式）、Divider 业务分段、12 列栅格排版及表单高级体验设置**（支持在有遗漏时通过 `update_worksheet` 进行二次补充）；
-- **准许调用工具清单 (Tool Whitelist)**：`["create_worksheet", "update_worksheet"]`；
-- **核心输入契约**：
-  - `hap-plan.json`：目标表的名称、描述、字段列表（`fields`）、表单设置（`formSettings`）；
-  - `hap-context.json`：`appId`、`appSectionIdByName`。
+- **执行方式**：独立 Subagent 按表并发执行（两遍建表 Pass 1）。
+- **输入切片**：读取 `.build/task-context/{taskId}.json`：
+  - `planSlice.worksheet`：当前表规划（含 `name`、`description`、`groupName`、`worksheetType`、`parentWorksheet`、`icon`、`fields` 紧凑字符串数组、`requirements`）；
+  - `planSlice.appLanguage`：应用内容语言代码；
+  - `contextSlice`：`appId`、`appSectionId`（按 `groupName` 查好的真实 `sectionId`）。
+- **必读领域规范**：`references/hap-domain-worksheet-spec.md`（若含自定义组件字段则按需查阅 `references/hap-domain-custom-field-spec.md`）
+- **准许工具白名单**：`["create_worksheet", "update_worksheet", "update_worksheet_settings"]`
 
 ---
 
-## 二、 引用的平台规格 (SSOT)
+## 二、 核心构建规则与执行步骤
 
-> [!IMPORTANT]
-> **Primary Reference (平台规格 SSOT)**：
-> 📖 [references/spec-worksheets.md](../../references/spec-worksheets.md)（工作表创建、字段类型、两遍建表、默认值、排版与表单高级设置）
-> 📖 [references/spec-custom-fields.md](../../references/spec-custom-fields.md)（自定义代码组件字段契约与 React 代码生成规范）
+- **输出语言与补充要求**：所有用户可见文本（`Divider` 分段名、`placeholder`、`desc`、`remark`、选项说明等）必须使用 `appLanguage` 指定语言；优先落实 `worksheet.requirements` 中的字段与表单细节。
+
+### 1. 紧凑字段展开与主动业务补全
+- **紧凑字符串解析**：
+  - 基础字段 `"字段名(Type)"` 展开为完整字段对象；
+  - 选项字段 `"字段名(SingleSelect|MultipleSelect|Dropdown:选项1/选项2)"`：**必须严格保留 Plan 给定的选项文本，不得增删改名**（下游视图筛选与工作流强依赖）；仅当 Plan 未带选项值时按业务语义补齐真实选项，严禁用“选项1/选项2”占位；
+  - `Collaborator` 成员单复数推导：未显式指定时，含“人/员/负责人”单数语义设 `config.isMultiple: false`，含“团队/参与人/协同人”复数语义设 `true`。
+- **主动扩展 7 维治理字段**（除子表/纯字典外）：结合业务上下游合理补齐状态阶段、优先级、归属协作（负责人/部门）、计划与实际时间、分类标签、归档/启用标记、附件/备注，并用 `Divider` 合理分段。
+- **标题字段（`isTitle`）唯一性兜底**：每表有且仅有一个合法标题字段（优先选识别度最高的 `Text` 或 `Concatenate`）；若全表均为人员/选项/关联等非法标题类型，**必须主动新建一个 `Text` 或 `AutoNumber` 字段设为 `isTitle: true`**。
+
+### 2. 两遍建表（Two-Pass）排版三步法
+1. **Step A — 过滤不占网格项并统一排布 12 列栅格**：
+   - 先剔除 `:reverse` 反向承接端字段（由对端 `:bi` 自动在标签页带出，不占表单网格）以及子表中指向 `parentWorksheet` 主表的父级关联字段；
+   - 对剩余**全部表单字段**（基础字段 + `selfRelation` 自关联 + 待补跨表 `Relation` `:bi/:uni` + `SubTable` + `Lookup/Rollup` + 公式）统一分配 `rowIndex` 与 `span`（推荐 `3 / 6 / 12` 栅格：同行 2 个字段用 `6 + 6 = 12` 消灭右侧留白；`SubTable` 与 `inlineTable` 独占整行 `span: 12`；单条关联无摘要用 `"dropdown"`，需摘要用 `"card"`）。
+2. **Step B — 剥离跨表与衍生字段并保留原行号间隙**：
+   - 从发送给 `create_worksheet` 的 `fields` 中剔除：① 所有跨表 `Relation:目标表` 与 `SubTable` 字段；② 所有 `Lookup` 与 `Rollup` 字段；③ 引用了跨表关联的 `Concatenate` 及引用了 `Lookup/Rollup` 的 `Formula`；
+   - **唯一自关联红线**：仅原文写为 `(selfRelation)` 的字段随本步直接创建（`dataSource: "selfRelation"`）；任何跨表 `(Relation:xxx)` **严禁伪造为 `selfRelation` 规避**！
+   - 保留下来的基础字段保持 Step A 的 `rowIndex / span` **原封不动**（允许行号跳号如 `0, 1, 3`，供 Pass 2 精准插回预留行）。
+3. **Step C — 构造完整 `relationLayout` 待办数组**：
+   - 将 Step B 剥离的每个字段记入输出 `relationLayout`（**每项必须带真实规划 `alias`，如 `biz_xxx`**）：
+     - `Relation`：`{ name, alias, targetWorksheet, rowIndex, span, displayMode, fieldType: "Relation", isMultiple, bidirectional }`（`:bi`→`true`，`:uni`→`false`；缺省时字典/仓库/商品等主数据引用推导为 `false`，核心主从业务穿透推导为 `true`）；
+     - `SubTable`：`{ name, alias, targetWorksheet, rowIndex, span: 12, fieldType: "SubTable", bidirectional: true }`；
+     - `Lookup`：`{ name, alias, rowIndex, span, fieldType: "Lookup", relationField, sourceFieldName }`（`relationField` 填本表关联字段 `alias`，`sourceFieldName` 填目标字段中文名）；
+     - `Rollup`：`{ name, alias, rowIndex, span, fieldType: "Rollup", relationField, sourceFieldName, calcType }`；
+     - 跨表 `Concatenate` / `Formula`：保留 `{ name, alias, rowIndex, span, fieldType, isTitle?, precision?, expression }`。
+
+### 3. 描述生成、建表调用与表单设置按需增强
+1. **描述文案必填**：生成表级 `remark`、原生 HTML 表级 `desc`（仅用 `<p>/<strong>/<br>`，禁转义实体）、按需 `importantNote`（`"#515151"`），以及每个输入字段的 `placeholder`、字段 `remark` 和按需 `desc`。
+2. **调用 `create_worksheet`（仅一次）**：
+   - 传入 `appId`、`name`、`alias`（`biz_xxx`）、`sectionId`（取 `appSectionId`）、`icon`（保留 `sys_` 前缀）、`displayType`（**当 `worksheetType === "subTable"` 时必须传 `2` 隐藏**，普通表传 `1` 或省略）、`createDefaultView: false`、`returnData: true`、`addRecordButtonName`、`fields`（Step B 过滤后的基础字段）。
+   - 若建表成功后发现遗漏了非关联基础字段，仅可用 `update_worksheet.addFields` 增量补齐（修改已有字段用 `editFields`），**严禁二次调用 `create_worksheet`**。
+3. **按需调用 `update_worksheet_settings`（子表与纯字典表直接跳过，严禁发空请求）**：
+   - 仅命中以下体验特征时调用 1 次：① 含商品/房源/设备实拍图 `Attachment` 时配 `form.cover`（高 200～400）；② 流程单据定制动作化 `form.title`（如“发起采购申请”）；③ 开启 `form.tabs.hideWhenSingle: true`（关联 Tab >3 个设 `"left"`，否则 `"top"`）；④ 审批单据配 `afterSubmit: { action: "openCreatedRecord" }`，高频建档表配 `continueCreation: { enabled: true }`，重大作废/调账单配 `submitConfirmation`。
 
 ---
 
-## 三、 单表执行 SOP 流水线（两遍建表三步法）
+## 三、 本地回执落盘契约
 
-### 1. 字段类型与排版三步法 (Two-pass Parallel)
+提取建表返回的真实 `worksheetId`、字段列表（含单多选/下拉的 `options` 数组！）与 `relationLayout`，写入 `receiptPath`（`.build/receipts/step2a-ws-{name}.json`）：
 
-#### Step A — 统一排所有需建表单字段（先过滤 :reverse 与 SubTable 父级关联）
-- **反向承接端（:reverse）不参与排版与创建**：Plan fields 中的 `:reverse` 字段是由对端 `:bi` 自动在详情页 Tab 标签页带出的反向表格，**不属于主表单网格字段（不占表单 rowIndex/span）**，在 Step A 开始前直接忽略过滤掉，**严禁记入 relationLayout**；
-- **子表端指向主表的父级关联不参与排版与创建**：若当前表为明细子表（`worksheetType: "subTable"` 或包含 `parentWorksheet`），主表在声明 `SubTable:当前子表` 时已自动在子表生成父级关联，子表 fields 中声明的指向主表的 `Relation:主表` 字段直接过滤掉，**严禁记入 relationLayout**；
-- 将剩余的**全部真实表单字段**（基础字段 + 自关联 + 跨表关联 `:bi`/`:uni` + SubTable 等）**一起**按正常网格规则分配 `rowIndex` 和 `span`（span=3/6/12，每行 span 和 ≤ 12）。
-
-#### Step B — 删跨表关联和衍生计算字段、保行号不变
-从 Step A 的完整 fields 列表中**剔除所有需后置在 Step 2b 补建的字段**：
-1. 跨表关联字段（包含 `Relation:目标表`）、SubTable 字段；
-2. Lookup 字段和 Rollup 字段；
-3. **跨表 Concatenate**：若 `Concatenate` 表达式引用了任何跨表 Relation 关联字段；
-4. **跨表/衍生 Formula**：若 `Formula` 表达式引用了任何 Lookup 他表字段或 Rollup 汇总字段；
-- 其余字段（基础业务 + 自关联 `selfRelation` + 仅引用本表基础字段的 Formula/Concatenate）的 `rowIndex`/`span` **原封不动**保留，不紧缩行号间隙。
-
-> [!CAUTION]
-> **自关联判定唯一标准**：只有 Plan 紧凑格式中原文写为 `(selfRelation)` 的字段才是自关联。所有 `(Relation:xxx)` 格式的跨表关联必须 100% 剔除并留待 Step 2b 补建，严禁使用自关联规避。
-
-#### Step C — 记录 relationLayout
-把 Step B 移除的每个待创建字段及其预留的 `rowIndex`/`span` 记入任务回执的 `outputs.relationLayout` 数组中（**再次确认已彻底剔除 `:reverse` 字段和 SubTable 子表端关联**）。
-
-### 2. 调用 MCP 建表 (create_worksheet)
-> [!IMPORTANT]
-> **子表类型导航隐藏铁律 (`displayType: 2`)**：
-> - 若当前表为明细子表（Plan 中 `worksheetType: "subTable"` 或包含 `parentWorksheet`），**必须传入 `"displayType": 2`（全部隐藏）**，使其仅作为嵌入子表控件展示，不在左侧导航栏暴露；
-> - 普通业务表/主表/字典表保持默认显示（`displayType: 1` 或不传）。
-
-调用 `create_worksheet`（**必须传入 `"createDefaultView": false`**，跳过平台自动生成默认全部视图，由后续步骤按规划顺序一次性建好）：
 ```json
 {
-  "appId": "<appId>",
-  "sectionId": "<sectionId>",
-  "name": "工作表名称",
-  "alias": "biz_xxx",
-  "icon": "12_2_book",
-  "createDefaultView": false,
-  "displayType": 2,
-  "fields": [ ...转化后的基础字段与Divider数组... ]
-}
-```
-获取返回的 `worksheetId` 及控件列表。
-
-### 3. 二次补充字段（按需 update_worksheet）
-若建表后发现某些基础字段配置有遗漏，可调用 `update_worksheet` 进行增量补充：
-```json
-{
-  "appId": "<appId>",
-  "worksheetId": "<worksheetId>",
-  "fields": [ ...遗漏需要追加的基础字段数组... ]
-}
-```
-若 Plan 中包含表单设置或表内包含附件封面图，调用 `update_worksheet_settings`：
-```json
-{
-  "worksheetId": "<worksheetId>",
-  "settings": {
-    "form": { "title": "提交业务单据", "cover": { "controlId": "...", "height": 300 } },
-    "submission": { "afterSubmit": "openCreatedRecord" }
-  }
-}
-```
-
----
-
-## 四、 输出交付物契约 (.build)
-
-执行成功后，将本表的 ID、关联待办与标准回执写入独立任务回执文件：
-- **文件路径**：`.build/receipts/step2a-ws-{targetWorksheet}.json`
-- **内容格式**：
-```json
-{
-  "taskId": "step2a-ws-{targetWorksheet}",
-  "executor": { "kind": "subagent", "agentId": "{agentId}" },
+  "taskId": "<来自 taskContext.taskId>",
+  "runId": "<来自 taskContext.runId>",
+  "executor": { "kind": "subagent", "agentId": "<当前子代理标识>" },
   "step": "2a",
-  "target": { "type": "worksheet", "name": "{targetWorksheet}" },
+  "target": { "type": "worksheet", "id": "<worksheetId>", "name": "<worksheetName>" },
   "status": "succeeded",
   "outputs": {
-    "worksheetId": "ws_xxxxxx",
-    "worksheetName": "客户",
-    "relationLayout": [ ...待 Pass 2 处理的关联字段... ]
+    "worksheetId": "<24位真实worksheetId>",
+    "worksheetName": "<worksheetName>",
+    "alias": "<biz_xxx>",
+    "fields": [
+      { "name": "状态", "id": "<24位字段id>", "alias": "biz_status", "type": "SingleSelect", "options": [{ "key": "...", "value": "待处理", "index": 1 }] }
+    ],
+    "relationLayout": []
   },
   "verification": {
     "passed": true,
-    "evidence": ["调用 create_worksheet 成功获取物理 worksheetId: ws_xxxxxx"]
+    "evidence": ["调用 create_worksheet 成功获取物理 worksheetId"]
   },
   "issues": []
 }
 ```
-
----
-
-## 五、 ⛔ 验证断言与错误自愈
-
-1. **断言 1 (建表成功)**：`create_worksheet` 返回成功且捕获合法物理 `worksheetId`（24 位 Hex 字符串）；
-2. **断言 2 (回执通知)**：将包含 `worksheetId`、`worksheetName` 与 `relationLayout` 的标准回执写入 `.build/receipts/step2a-ws-{targetWorksheet}.json`；
-3. **自愈机制**：若创建报错提示 alias 重复，追加随机后缀安全重试；若网络超时，先查询确认是否已建成功。

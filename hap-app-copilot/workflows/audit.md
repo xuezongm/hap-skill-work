@@ -9,8 +9,8 @@
 1. 先读 `audit/audit-checks.md`：确定检查项、证据要求、严重度和评分规则。
 2. 制定取证方案前读 `audit/collection-guide.md`：确定接口、读取范围和停止条件。
 3. 仅在需要业务语义判断时读取：
-   - `references/guide-design.md`：数据模型、表单、视图、页面和导航；
-   - `references/guide-workflows.md`：流程闭环、节点设计和异常路径。
+   - `references/hap-app-design-guide.md`：数据模型、表单、视图、页面、门户与导航设计准则；
+   - `references/hap-workflow-design-guide.md`：流程闭环、节点设计、触发防环与异常路径。
 
 `audit/audit-checks.md` 是检查和评分的唯一事实源。设计指南只能帮助解释，不得产生没有稳定 `CHK-*` 对应项的计分问题。
 
@@ -143,10 +143,10 @@
 
 普通 P0/P1 finding 继续使用 `compact`。命中安全维度检查项不等于自动升级；只有明确存在证据留存或责任追溯要求时才设置 `retention_required`。
 
-正式审查使用带业务名称的独立运行目录：
+正式审查使用带业务名称的独立运行目录（位于 `.hap-copilot/` 隐藏工作目录内，零污染代码工作区）：
 
 ```text
-{PROJECT_ROOT}/audit/{appName}--{appId末8位}/{runId}/
+{PROJECT_ROOT}/.hap-copilot/audit/{appName}--{appId末8位}/{runId}/
 ├── results.json
 └── report.md
 ```
@@ -156,7 +156,7 @@
 `archive` 模式在运行目录下增加 `evidence/` 目录，但只保存触发升级的相关来源对象的原始返回，不追溯保存本次全部工具返回：
 
 ```text
-{PROJECT_ROOT}/audit/{appName}--{appId末8位}/{runId}/
+{PROJECT_ROOT}/.hap-copilot/audit/{appName}--{appId末8位}/{runId}/
 ├── evidence/
 │   └── {对象名称}--{对象ID末8位}.json
 ├── results.json
@@ -294,7 +294,7 @@
 执行：
 
 ```bash
-python3 {SKILL_DIR}/scripts/audit_calc.py {PROJECT_ROOT}/audit/{appName}--{appId末8位}/{runId}/results.json
+python3 {SKILL_DIR}/scripts/audit_calc.py {PROJECT_ROOT}/.hap-copilot/audit/{appName}--{appId末8位}/{runId}/results.json
 ```
 
 脚本校验路由字段、检查项覆盖、来源和事实引用、Finding 规则绑定，并在适用时计算分数和来源统计；不负责取证或业务判断。快速筛查不运行该脚本。将脚本输出写入报告，不得手工另算一套分数。
@@ -344,7 +344,7 @@ python3 {SKILL_DIR}/scripts/audit_calc.py {PROJECT_ROOT}/audit/{appName}--{appId
 
 ## 七、衔接 Modify
 
-`repairIntent=true` 时，在报告摘要后按风险和业务价值展示 2～5 个候选 finding，并请用户选择；高价值补充观察可以另行展示，但不得伪装成 finding 或自动视为已授权修改。用户已经用 finding ID、严重度范围等方式明确修复范围时，可以直接使用该范围；用户明确选择某条观察时，将其作为新的直接修改请求，必要时先确认目标状态。
+`repairIntent=true` 时，在报告摘要后若宿主支持 `ask_question`，直接调用 `ask_question`（设 `is_multi_select: true`）按风险和业务价值列出 2～5 个优先候选 finding 供用户直接勾选要修复的项（正文不重复罗列同一组选项；无该工具时用简明列表展示）；高价值补充观察可以另行说明，但不得伪装成 finding 或自动视为已授权修改。用户已经用 finding ID、严重度范围等方式明确修复范围时，可以直接使用该范围；用户明确选择某条观察时，将其作为新的直接修改请求，必要时先确认目标状态。
 
 用户选择修复范围后，回到根 `SKILL.md` 的"审查后修复"流程：
 

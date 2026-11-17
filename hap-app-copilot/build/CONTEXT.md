@@ -1,72 +1,58 @@
 # hap-context.json 结构定义
 
-本文件定义 `{PROJECT_ROOT}/apps/{appName}/hap-context.json` 的完整结构。所有步骤读写 context 时必须遵守此 schema。
+本文件定义 `{PROJECT_ROOT}/.hap-copilot/apps/{appName}/hap-context.json` 的权威结构。所有构建步骤与运行时脚本读写上下文时必须遵守此契约。
 
-## 结构
+## 一、 标准 JSON 结构
 
 ```json
 {
   "appId": "string",
   "appName": "string",
   "org_id": "string",
-  "progress": "string (见 PROGRESS.md)",
+  "language": "zh-CN",
+  "progress": "string (见 build/PROGRESS.md)",
 
-  "sectionIdByName": {
-    "分组名称": "sectionId"
+  "sectionIdByName": { "分组名称": "sectionId" },
+  "worksheetIdByName": { "工作表名称": "worksheetId" },
+  "relationLayoutByWorksheet": {
+    "工作表名称": [
+      { "name": "关联客户", "alias": "biz_cust", "fieldType": "Relation", "targetWorksheet": "客户", "rowIndex": 2, "span": 6, "isMultiple": false, "bidirectional": true, "displayMode": "card" }
+    ]
   },
-  "worksheetIdByName": {
-    "工作表名称": "worksheetId"
+  "worksheetFieldsPreview": {
+    "工作表名称": [{ "name": "客户名称", "id": "fieldId", "alias": "biz_name", "type": "Text" }]
   },
-  "actionIdByName": {
-    "动作名称": "actionId"
-  },
-  "viewIdByName": {
-    "工作表名称-视图名称": "viewId"
-  },
-  "customPageIdByName": {
-    "页面名称": "pageId"
-  },
-  "chatbotIdByName": {
-    "助手名称": "chatbotId"
-  },
-  "roleIdByName": {
-    "角色名称": "roleId"
-  },
+  "fieldOptionsContext": [
+    { "name": "工作表名称", "fields": [{ "name": "状态", "alias": "biz_status", "options": [{ "key": "opt_1", "value": "待处理", "index": 1 }] }] }
+  ],
+  "viewIdByName": { "工作表名称/视图名称": "viewId" },
+  "viewsByWorksheet": { "工作表名称": [{ "name": "全部记录", "id": "viewId", "type": "table" }] },
+  "actionIdByName": { "工作表名称/动作名称": "actionId" },
+  "actionProcessIdByKey": { "工作表名称::动作名称": "processId" },
+  "customPageIdByName": { "页面名称": "pageId" },
+  "chatbotIdByName": { "助手名称": "chatbotId" },
+  "roleIdByName": { "角色名称": "roleId" },
+  "roleContext": [{ "name": "角色名称", "id": "roleId", "roleScope": "general" }],
+
+  "workflowResults": [],
+  "customActionWorkflowResults": [],
   "appDescUpdated": true,
+  "itemsSorted": true,
   "sampleDataCreated": true,
   "buildRun": {
     "runId": "string",
     "executionMode": "subagent_required",
     "lastPhaseReport": ".build/phase-report.json",
     "blocked": false
-  },
-  "customActionWorkflows": [
-    {
-      "actionName": "string",
-      "processId": "string",
-      "published": true
-    }
-  ]
+  }
 }
 ```
 
-## 异步任务持久化回执与幂等规则
+## 二、 单写入者与字段通道规则
 
-- **`appDescUpdated: true`**：Step 1b（描述与手册更新）完成回执。断点恢复时若为 `true` 则跳过 Step 1b。
-- **`sampleDataCreated: true`**：Step 5（示例数据写入）完成回执。断点恢复时若为 `true` 则跳过 Step 5，**严禁重复写入导致数据翻倍**。
-- **`workflows[i].processId`（记录在 `hap-plan.json`）**：Step 10 完成回执。断点恢复时若某系统工作流已有 `processId`，则跳过创建直接校验/发布。
-- **`customActionWorkflows[i].published: true`**：Step 11 完成回执。断点恢复时若已发布则跳过。
-
-## 写入规则
-
-- **由确定性脚本独占写入**：所有 ID 映射和 `progress` 只能由 `build_runtime.py advance` 在阶段报告放行后原子写入，主调度器与 Subagent 严禁直接手工修改
-- **只存 ID 映射**，不存 MCP 原始返回的完整对象
-- 字段结构（fields）存储在独立文件 `worksheetContext.json`，不写入 `hap-context.json`，避免上下文膨胀
-
-## worksheetContext.json 使用契约
-
-`worksheetContext.json` 由阶段 2（Step 3 收集与 `merge_worksheet_context`）原子生成写入，**Step 4~11 只读**。
-
-- Step 4~11 中需要的字段 ID、选项 key 等，**必须且只能从 `worksheetContext.json` 查找，严禁重复调用 `get_worksheet_structure`**
-- 视图 ID 从 `viewIdByName`（存储在 `hap-context.json`）中获取
-- 该文件在阶段 2 写入后**不再修改**
+1. **单写入者原则**：除 Step 1 初始化外，所有 ID 映射与 `progress` 均由 `scripts/build_runtime.py advance` 在阶段报告放行后独占原子写入，主调度器与 Subagent 严禁直接修改 `hap-context.json`。
+2. **两遍建表与选项保真通道**：
+   - `relationLayoutByWorksheet` 与 `worksheetFieldsPreview` 在阶段 1.5（Step 2a 完成后）保存，供 Step 2b 精准回填预留 `rowIndex/span` 与 `showFields`；
+   - `fieldOptionsContext` 保留 Step 2a 建表时的单多选/下拉选项列表，供 Step 5 示例数据生成真实选项值，防止字段结构刷新时丢失选项细节；
+   - `actionProcessIdByKey` 按 `"{工作表名}::{动作名}"` 复合键存储 Step 3 创建按钮返回的预建 `processId`，确保不同工作表上的同名按钮（如多张表均有「提交审批」）互不覆盖。
+3. **`worksheetContext.json` 只读共享契约**：由阶段 2 末尾调用 `scripts/merge_worksheet_context.py` 强校验合并生成，阶段 3 与阶段 4 所有任务直接消费切片，无需重复调用 `get_worksheet_structure`。

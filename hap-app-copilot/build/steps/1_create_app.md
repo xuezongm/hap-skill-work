@@ -1,149 +1,67 @@
-# Step 1: 创建应用与导航分组 SOP (1_create_app)
+# Step 1: 创建应用外壳、导航分组与页面空壳 SOP (`1_create_app`)
 
-本文档是 Build 阶段 **Step 1（创建应用外壳、导航分组与自定义页面空壳）** 的专属作业指导书。由主调度器极速内联执行，为后续全量并发搭建奠定全局物理实体基础。
+<!-- SOURCE: build-app/create-app-sub-agent.yaml -->
+<!-- SOURCE: build-app/custom-page-create-sub-agent.yaml -->
 
----
+## 一、 本地宿主输入与参考映射
 
-## 目录
-
-1. [执行定位与输入契约](#一-执行定位与输入契约)
-2. [引用的平台规格 (SSOT)](#二-引用的平台规格-ssot)
-3. [参数规则与选型规范](#三-参数规则与选型规范)
-4. [执行 SOP 流水线](#四-执行-sop-流水线)
-5. [写入应用访问链接](#五-写入应用访问链接)
-6. [输出交付物契约](#六-输出交付物契约)
-7. [⛔ 验证断言与错误自愈](#七-⛔-验证断言与错误自愈)
+- **执行方式**：主调度器极速内联执行（建壳、建分组、建页面空壳），随后紧接阅读 `build/steps/1b_update_app_desc.md` 内联更新应用说明与使用手册，一并将物理 ID 写入 `hap-context.json` 并置 `progress = "app_created"`。
+- **输入数据来源**：`{PROJECT_ROOT}/.hap-copilot/apps/{appName}/hap-plan.json`（含 `org_id`、`appName`、`appIcon`、`appColor`、`navLayout`、`navColor`、`enableExternalPortal`、`requirements`、`navGroups`、`customPages`）。
+- **必读领域规范**：`references/hap-domain-app-spec.md`、`references/hap-icon-palette.md`
+- **准许工具白名单**：`["create_app", "create_app_sections", "create_app_items"]`
 
 ---
 
-## 一、 执行定位与输入契约
+## 二、 核心构建规则与执行步骤
 
-- **执行方式**：主调度器内联 1 步极速执行；
-- **任务目标**：根据 `hap-plan.json` 创建应用实体外壳、所有导航分组（Section）以及自定义页面空壳，并写入应用访问链接；
-- **核心输入契约**：
-  - `org_id`：组织 ID（来自 `hap-plan.json` 或 `hap-context.json`）；
-  - `appName`：应用名称；
-  - `appIcon`：应用图标；
-  - `appColor`：应用主题配色；
-  - `navLayout`（可选）：导航布局形态；
-  - `navColor`（可选）：导航栏背景配色；
-  - `enableExternalPortal`（可选）：是否启用外部门户；
-  - `navGroups`（或 `sections`）：导航分组列表；
-  - `customPages`：自定义页面规划列表。
+### Part A：创建应用实体与导航分组（源自 `create-app-sub-agent.yaml`）
 
-> 💡 **说明**：本步骤无需处理 `remark` 和 `desc`。应用的详细描述和使用手册会作为独立的后台任务（Step 1b）并发配置。创建应用时无需传这两个参数（或传空）。
+1. **解析应用级 `requirements` 与默认推断规则**：
+   - 将顶层 `requirements` 中的导航与应用设置要求优先映射到 `create_app` 参数（应用介绍与使用手册交由异步 Step 1b 处理，本步**严禁传 `remark` 和 `desc`**）；
+   - **`navLayout` 推断规则**（用户明确要求优先，如“顶部导航”→`top`、“树形导航”→`tree`、“分组导航”→`group`、“卡片导航”→`card`；未指定时默认 `group`，层级深选 `tree`，多独立业务域并列选 `top`，门户工作台型选 `card`）；
+   - **`navColor` 推断规则**（仅限枚举 `appColor | white | gray | black`，不支持自定义 HEX：蓝/绿/紫等深色主题默认 `appColor`；红/橙/黄等亮色主题选 `white`；重工/监控中心选 `black`；明确要求灰色选 `gray`）。
+2. **调用 `create_app`（仅一次，失败即阻断）**：
+   - `orgId`：`hap-plan.json` 中的 `org_id`（必填，注意参数名为 `orgId` 而非 `projectId`）；
+   - `name`：`appName`（必填）；
+   - `icon`：`appIcon`（带 `sys_` 前缀的合法 `fileName`）；
+   - `color`：`appColor`（HEX 色值，注意参数名为 `color` 而非 `iconColor`）；
+   - `navLayout` / `navColor`：按上述规则取值；
+   - `enableExternalPortal`：默认 `false`（规划含外部门户角色时为 `true`）；
+   - 提取返回的真实 24 位 `appId`。
+3. **批量创建导航分组 `create_app_sections`**：
+   - 若 `navGroups` 非空，按 `navGroups` 原顺序（严禁重排）转为 `sections: [{ "name": "<分组名>" }, ...]`，调用一次 `create_app_sections(appId, sections)`；
+   - 建立分组名称到真实 ID 的映射字典 `sectionIdByName`。
 
----
+### Part B：批量创建自定义页面空壳（源自 `custom-page-create-sub-agent.yaml`）
 
-## 二、 引用的平台规格 (SSOT)
+1. **组装页面项列表**：遍历 `customPages`（合并全部 `dashboard` 与 `workspace` 页面），为每页构造一个 `item`：
+   - `name`：页面名称原样；
+   - `type`：固定 `"customPage"`；
+   - `icon`：优先原样使用页面规划的 `sys_` 前缀 `icon`；缺失时回退（`dashboard` → `"sys_dashboard"`，`workspace` → `"sys_hr_workbench"`）；
+   - `sectionId`：从 `sectionIdByName` 按 `groupName` 反查（查不到则省略）；
+   - `remark`：根据页面 `description` 用 `appLanguage` 生成一句简洁业务定位说明。
+2. **一次性调用 `create_app_items`**：
+   - 当 `customPages` 非空时，将全部页面合并到同一次 `create_app_items(appId, items)` 调用中（成功后严禁二次调用）；
+   - 从返回结果提取每个页面的真实 24 位 hex `id`，建立 `customPageIdByName`（`{ "<页面名>": "<pageId>" }`）与 `customPageContext`（`[{ "name", "pageId", "description" }]`）。
 
-> [!IMPORTANT]
-> **Primary Reference (平台规格 SSOT)**：
-> 📖 [references/spec-app-styles.md](../../references/spec-app-styles.md)（官方受控图标库、9种主题色盘、navLayout布局与navColor配色）
+### Part C：写入应用直达链接卡片
 
----
-
-## 三、 参数规则与选型规范
-
-- **`icon` / `iconColor`**：必须遵循 `spec-app-styles.md`，使用官方 9 色板 Hex 与受控图标；
-- **`navLayout` / `navColor`**：按 `spec-app-styles.md §2, §3` 选型（常规推荐 `group` + `appColor`）；
-- **`enableExternalPortal` (外部门户)**：若 `hap-plan.json` 中规划了外部门户角色（`roleScope: "externalPortal"`），创建应用时 `enableExternalPortal` 必须传 `true`。
-
----
-
-## 四、 执行 SOP 流水线
-
-1. **创建应用外壳实体**：
-   调用 `create_app`：
-   ```json
-   {
-     "projectId": "<org_id>",
-     "name": "<appName>",
-     "icon": "<appIcon>",
-     "iconColor": "<appColor>",
-     "navColor": "<navColor, 默认 appColor>",
-     "navLayout": "<navLayout, 默认 group>",
-     "enableExternalPortal": <true/false>
-   }
-   ```
-   获取返回的 `appId`。
-
-2. **批量创建导航分组 (Sections)**：
-   若 Plan 中规划了导航分组，调用 `create_app_sections`：
-   ```json
-   {
-     "appId": "<appId>",
-     "sections": [ ...navGroups 或 sections 数组... ]
-   }
-   ```
-   获取各分组的 `sectionId` 并建立名称映射字典 `sectionIdByName`。
-
-3. **批量创建自定义页面空壳 (Custom Pages)**：
-   遍历 `customPages` 规划列表，对每个页面调用 `create_app_items` 创建空白页面项：
-   - `type`: `1` (自定义页面)
-   - `name`: 页面名称
-   - `icon`: 依据页面类型规范设定：
-     - **仪表盘/数据看板 (`dashboard`)**：固定传 `"sys_control-panel_traffic"`
-     - **业务工作台 (`workspace`)**：固定传 `"2_3_statistics"`
-   - `sectionId`: 从刚刚建立的 `sectionIdByName` 中查找所在导航分组 ID
-   - `remark`: 阐明该页面的业务定位与核心价值
-   - 记录 `"页面名称" → pageId` 的映射到字典 `customPageIdByName` 中。
-
-4. **写入应用访问链接**：
-   执行下方【五、写入应用访问链接】规范，将直达 URL 写入 `overview.md` 首行。
-
-5. **落盘更新 `hap-context.json`**：
-   将 `appId`、`sectionIdByName`、`customPageIdByName` 写入 `hap-context.json`，并写入 `progress="app_created"`。
+根据当前 MCP 服务对应域名（如 `meihua.mingdao.com`、`sandbox.mingdao.com` 或 `www.mingdao.com`），在 `{PROJECT_ROOT}/.hap-copilot/apps/{appName}/overview.md` 顶部写入访问链接提示块 `https://{前端域名}/app/{appId}`。
 
 ---
 
-## 五、 写入应用访问链接
+## 三、 本地状态落盘契约
 
-根据当前使用的 MCP 服务地址，确定前端访问域名：
+将初始化结果写入 `{PROJECT_ROOT}/.hap-copilot/apps/{appName}/hap-context.json`（若走运行时引擎也可同步写入 `.build/receipts/step1-app-init.json`）：
 
-| MCP 服务地址 | 前端域名 |
-|:---|:---|
-| `api.mingdao.com/mcp` | `www.mingdao.com` |
-| `api2.mingdao.com/mcp` | `meihua.mingdao.com` |
-| `api3.mingdao.com/mcp` | `sandbox.mingdao.com` |
-
-拼接应用访问链接：`https://{前端域名}/app/{appId}`，并在 `{PROJECT_ROOT}/apps/{appName}/overview.md` 文件的最顶端（第 1 行）追加写入链接卡片：
-
-```markdown
-> [!TIP]
-> **🎉 应用已物理创建成功！**
-> **访问链接**：[点击此处立即进入系统 ➔](https://{前端域名}/app/{appId})
-
----
-```
-
----
-
-## 六、 输出交付物契约
-
-主调度器直接将物理 ID 映射写入 `{PROJECT_ROOT}/apps/{appName}/hap-context.json`：
 ```json
 {
   "appName": "<appName>",
-  "appId": "app_xxxxxx",
+  "appId": "<24位真实appId>",
   "org_id": "<org_id>",
+  "language": "<language>",
   "progress": "app_created",
-  "sectionIdByName": {
-    "业务大厅": "sec_1",
-    "系统配置": "sec_2"
-  },
-  "customPageIdByName": {
-    "运营大盘": "page_1"
-  }
+  "sectionIdByName": { "业务总览": "<sectionId>" },
+  "customPageIdByName": { "经营看板": "<pageId>" }
 }
 ```
-
----
-
-## 七、 ⛔ 验证断言与错误自愈
-
-1. **断言 1 (应用存在)**：`appId` 必须非空且有效；
-2. **断言 2 (分组完整)**：返回的 `sectionIdByName` 数量必须等于 Plan 中的 `navGroups` 数量；
-3. **断言 3 (页面完整)**：`customPageIdByName` 数量必须等于 Plan 中的 `customPages` 数量；
-4. **自愈机制**：若某分组或页面创建失败，立即针对性重试调用 `create_app_sections` 或 `create_app_items` 补齐；
-5. **推进阶段**：写入 `progress="app_created"` 后，立即进入 Phase 1.5（并发派发 Step 1b 与 Step 2a Subagents）。

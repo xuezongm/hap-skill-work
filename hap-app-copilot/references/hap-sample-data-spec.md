@@ -1,3 +1,84 @@
+# HAP 示例数据生成规范
+
+输入映射、数量、附件填充范围、执行授权与回执遵循调用 Agent 的任务和专用规则；本规范只说明如何生成数据。参数结构和字段写入方式以当前 MCP Schema 为准。
+
+## 字段定位与写入
+
+- 复用已提供且有效的工作表、字段和选项信息，仅在缺失时读取必要结构。
+- `worksheet_id` 和 `fields[].id` 使用真实 ID，不以名称、alias 或另一个对象的 ID 代替。
+- `batch_create_records.rows` 每行使用 `{ "fields": [{ "id": "<字段ID>", "value": <值> }] }`；字段对象通常只需 `id` 和 `value`。可选 `type` 是接口行为标志，不是字段类型，不传 `"Attachment"`、`"Text"` 等类型名。
+- 必填的可写字段必须有值；可写标题使用有业务含义的内容，自动编号、拼接标题、公式和汇总等只读字段不传值。
+- 选项必须来自当前字段的有效选项，不为示例增加选项。示例人员按下节选择；部门和角色使用已知有效 ID，不自行编造。
+- 所有示例写入显式使用 `triggerWorkflow: false`。
+
+## 字段填值
+
+以下为常用格式；具体可写类型及取值以当前 Schema 和字段设置为准。
+
+| 字段类型 | 物理传值格式 | 规范要求与示例 |
+| :--- | :--- | :--- |
+| **Text / RichText** | `string` | 传真实内容字符串。RichText 可包含简单的 HTML 标签。 |
+| **PhoneNumber / LandlinePhone** | `string` | 传真实格式的电话号码（如 `"13800138000"` 或 `"021-88888888"`）。 |
+| **Email** | `string` | 传真实格式的邮箱地址（如 `"user@example.com"`）。 |
+| **Number / Currency** | `number` | 传纯数值（如 `150`、`99.5`），不可带单位。 |
+| **SingleSelect / Dropdown** | `string[]` | 传入**单个选项值（字符串）放入数组**：`["选项值"]`。选项值必须从已知字段选项中取。 |
+| **MultipleSelect** | `string[]` | 传入**多个选项值字符串的数组**：`["选项A", "选项B"]`。 |
+| **Date / DateTime** | `string` | 传 `"YYYY-MM-DD"` 或 `"YYYY-MM-DD HH:mm"` 格式字符串。日期范围服从任务要求。 |
+| **Time** | `string` | 传 `"HH:mm:ss"` 格式字符串（如 `"14:30:00"`）。 |
+| **Checkbox** | `number` | `1` 表示勾选，`0` 表示未勾选。 |
+| **Rating** | `string` | 传表示星级的数字字符串，如 `"4"`、`"5"`。 |
+| **Location** | `string` | 传 JSON 序列化后的字符串：`"{\"x\":116.397428,\"y\":39.904989,\"address\":\"天安门广场\",\"title\":\"北京天安门\"}"` |
+| **Region** | `string` | 传行政区划代码字符串，如 `"110100"`（北京市）、`"310000"`（上海市）、`"440100"`（广州市）。 |
+| **Collaborator** | `string[]` | 按下节选择用户指定成员或预设虚拟用户；单选传 1 个，多选传多个。 |
+| **Department / Role** | `string[]` | 使用已知有效的部门或角色 ID；非必填且无可用值时可省略。 |
+| **Attachment** | `object[]` | 从内置预设附件列表中挑选契合场景的资源。格式：`[{"name":"业务合同.pdf", "url":"https://..."}]`。 |
+| **Relation** | `string[]` | **核心关系关联**：传入目标表的 `rowId` 数组（经真实结构确认是指向主表的关联时，填入主表的 rowId）。 |
+| **其他类型** | **直接跳过，不传** | 如 `Signature`（签名）、`AutoNumber`（自动编号）、`Formula` / `DateFormula`（公式）、`AutoID`（系统字段）、`Lookup`（他查）、`Rollup`（汇总）、`Divider`（分段）、`Concatenate`（拼接）等类型，一律不传值。
+
+## 示例人员与预设虚拟用户
+
+- 用户指定成员时优先使用已确认的对应 ID；未指定的示例人员可直接从下表选择，不为生成样例另行查询真实成员或要求用户选择。
+- 按示例内容语言选择：中文使用中文组，其余语言使用英文组；多条记录可分散取值以呈现多人协作。预设 ID 必须原样使用，不改写、不拼接。
+- 预设虚拟用户只用于示例记录的成员字段；真实业务初始化、迁移和回填仍使用实际业务成员，不以虚拟用户替代。
+
+| userId | 姓名 (中文系统) | userId | 姓名 (英文系统) |
+| :--- | :--- | :--- | :--- |
+| `virtualuser-cn-1` | 赵子轩 | `virtualuser-en-1` | Michael Brown |
+| `virtualuser-cn-2` | 刘思涵 | `virtualuser-en-2` | Emma White |
+| `virtualuser-cn-3` | 周睿哲 | `virtualuser-en-3` | Robert Lee |
+| `virtualuser-cn-4` | 林雨欣 | `virtualuser-en-4` | Emily Davis |
+| `virtualuser-cn-5` | 孙泽宇 | `virtualuser-en-5` | John Smith |
+| `virtualuser-cn-6` | 陈嘉怡 | `virtualuser-en-6` | David Wilson |
+| `virtualuser-cn-7` | 王强 | `virtualuser-en-7` | Sophia Johnson |
+| `virtualuser-cn-8` | 张丽莉 | `virtualuser-en-8` | James Miller |
+| `virtualuser-cn-9` | 李浩宇 | `virtualuser-en-9` | Olivia Taylor |
+| `virtualuser-cn-10` | 吴勇 | `virtualuser-en-10` | David Anderson |
+
+## 关联与主从数据
+
+- 按实际引用依赖安排创建顺序，直接复用前序创建返回或已验证记录的真实 `rowId`，不使用标题、占位符或猜测 ID。
+- 自关联先创建不依赖父记录的根节点，再用返回的 ID 创建子节点；数量由任务决定。
+- 主从数据采用当前 MCP 支持的写入方式。若支持对子表独立批量新增，先取得主记录 ID，并依据真实结构中的关联目标定位父关联字段，每条明细填入对应主记录 ID；不按字段名称猜测关系。明细内容应贴合对应主记录，不生成无归属明细。
+- 缺少关联值时，仅可省略不影响本次目标的非必填关系；必填关系或主从归属缺失时，先解决该依赖，不以空关联写入代替完成。
+- 完整成功响应可作为创建依据，真实 ID 立即供后续引用。不因公式或汇总异步暂空反复查询或重新创建；部分失败及未知写入按调用 Agent 的恢复规则处理。
+
+## 内容质量
+
+- 使用自然业务命名，不加“示例”前后缀，不用“测试 1”“占位 A”等名称。是否在备注标记由调用 Agent 决定。
+- 名称、金额、日期、状态和明细相互一致，语言服从任务要求；在数量允许时覆盖有代表性的状态与分类，按业务特点分配，不机械均分。
+- 常规模拟业务数据直接结合上下文生成，不联网搜索。任务要求权威标准数据时不能虚构；检索权限和具体工具由调用 Agent 决定。
+
+## 预设附件资源
+
+需要填充附件时从下列资源选择，并重命名为符合记录语境的文件名。合同、报告、清单等使用文档；照片、主图、现场、头像等使用对应实体类别的图片。附件填充范围由调用 Agent 决定，不因资源存在而扩展任务。
+
+### 文档类资源
+| 文件名 | 链接 |
+|---|---|
+| Sample Document.pdf | https://p2.mingdaoyun.cn/sampledocument/74005043-A19F-4704-942B-DC63C13986DA.pdf |
+| Sample Document.docx | https://p2.mingdaoyun.cn/sampledocument/FF4297A4-7C5F-45CC-982A-CAA5DEE6EFEB.docx |
+| Supplementary Data Table.xlsx | https://p2.mingdaoyun.cn/sampledocument/50E3CEC4-1CA6-4633-9248-4266E1AF685F.xlsx |
+
 ### 图片类资源 (Categorized Images)
 
 #### 商品/物品 (Product)

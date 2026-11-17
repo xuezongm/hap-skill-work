@@ -1,145 +1,62 @@
-# Step 6: 配置自定义页面与统计图表 SOP (6_create_pages)
+# Step 6: 自定义页面组件组装与布局校正 SOP (`6_create_pages`)
 
-本文档是 Build 阶段 **Step 6（按页面并发配置自定义页面组件与统计图表）** 的专属作业指导书。
+<!-- SOURCE: build-app/custom-page-config-sub-agent.yaml -->
 
----
+## 一、 本地宿主输入与参考映射
 
-## 目录
-
-1. [执行定位与输入契约](#一-执行定位与输入契约)
-2. [引用的平台规格 (SSOT)](#二-引用的平台规格-ssot)
-3. [单页面执行 SOP 流水线](#三-单页面执行-sop-流水线)
-4. [输出交付物契约 (.build)](#四-输出交付物契约-build)
-5. [⛔ 验证断言与错误自愈](#五-⛔-验证断言与错误自愈)
-
----
-
-## 一、 执行定位与输入契约
-
-- **执行方式**：子代理按页面并发；
-- **任务目标**：根据切片规划为自定义页面批量创建统计图表（柱状图/折线图/数值指标卡等），并将图表、富文本、视图等组件编排入页面布局中；
-- **核心输入契约（全部预装在任务切片中，直接读取内存切片即可）**：
-  - `taskContext.planSlice.page`：当前页面的图表（`charts`）或组件（`components`）规划；
-  - `taskContext.worksheetContextSlice`：全量工作表的真实字段结构与 controlId 映射（**已包含全量字段映射，直接读取使用，严禁调用 `get_worksheet_structure`**）；
-  - `taskContext.contextSlice`：包含 `appId`、`pageId`、`worksheetIdByName`、`viewIdByName`（**已包含当前页面 ID 与视图 ID，直接使用，严禁调用 `get_custom_page_structure`**）。
+- **执行方式**：独立 Subagent 按单个自定义页面并发执行（页面空壳已由 Step 1 创建就绪）。
+- **输入切片**：读取 `.build/task-context/{taskId}.json`：
+  - `planSlice`：`page`（含 `name`、`type`: `"dashboard" | "workspace"`、`description`、`charts` 或 `components`、`requirements`）、`appColor`、`appLanguage`；
+  - `contextSlice`：`appId`、`pageId`（24 位真实 hex）、`worksheetIdByName`、`viewIdByName`；
+  - `worksheetContextSlice`：全量已建工作表及真实字段列表（含 `id`、`alias`、`type`、`options`）。
+- **必读领域规范**：`references/hap-domain-custom-page-spec.md`、`references/hap-chart-design-guide.md`（若需挑选数值卡片图标，按需查阅 `references/hap-icon-palette.md`）
+- **准许工具白名单**：`["update_custom_page", "get_custom_page_structure", "patch_custom_page_components"]`（**严禁调用 `create_chart`**！自定义页面内图表统一作为页面内联组件保存）
 
 ---
 
-## 二、 引用的平台规格 (SSOT)
+## 二、 核心构建规则与执行步骤
 
-> [!IMPORTANT]
-> **Primary Reference (平台规格 SSOT)**：
-> 📖 [references/spec-pages-charts.md](../../references/spec-pages-charts.md)（自定义页面 24 栅格、FiltersGroup 联动与 9 种图表 Schema）
+- **输出语言与补充要求**：页面内所有组件标题、按钮文案与筛选名称使用 `appLanguage` 指定语言；优先落实 `page.requirements` 中的视觉、图标显隐与对齐要求。
+
+### 1. 指标核实、组件映射与整页组装
+1. 若 `pageId` 为空，直接写入 `completed: false` 回执结束，不调任何工具。
+2. **先核实指标可实现性**：从 `worksheetContextSlice` 确定每个指标的真实数据源 `worksheetId`、字段 `id`/`alias` 与聚合口径（已有匹配的汇总/公式字段直接聚合，不重复套计算；差额保留减项、比率保留分母，无法由现有字段真实表达的指标跳过并记入 `notes`，严禁用恒零或无关总额冒充）。
+3. **视图 ID 反查铁律**：组件引用视图时，必须从 `viewIdByName` 按目标表查找语义为“全部/All”的真实 24 位 `viewId`（找不到则取该表第一个真实 `viewId`），严禁填视图中文名、表名或空串。
+4. **共用组件映射与 `filtersGroup` 置后输出**：
+   - 为每个内联图表/视图分配稳定的本地 UUIDv4 `objectId`，`filtersGroup` 同一业务条件只建一个筛选项（内层 `filterId` 传 UUIDv4，外层 `filtersGroupId` 留空不传），在 `objectControls` 中绑定所有语义兼容的图表/视图 `objectId`；
+   - `components` 数组中先排列被引用的 `chart` / `view` 组件，最后输出 `filtersGroup`（其坐标 `position` 仍置顶于 `y: 0`）；
+   - **Dashboard** 按 `references/hap-domain-custom-page-spec.md` 转换全部有效 `charts` 并配齐 48 栅格排版；**Workspace** 转换 `Button / View / Text / Carousel` 并按规范默认补齐 KPI 卡片与右侧辅助分析图（`page.requirements` 明确排除统计时除外）；
+   - **数值卡图标**：需显示图标时从 `references/hap-icon-palette.md` 选带 `sys_` 前缀的合法 `fileName` 写入 `components[].config.config.numberCard` 并显式开启图标显示开关，量级/小数位/单位写入 `values[]`。
+
+### 2. 一次全量保存 + 摘要布局检查 + 局部补丁校正
+1. **一次全量保存**：调用 1 次 `update_custom_page(appId, page_id: pageId, components)` 保存整页组件树（若写入前参数校验报错未落库，一次集中修正全部错误路径后重提，最多 3 次；**一旦保存成功严禁再次调用 `update_custom_page`**）。
+2. **写后布局检查**：保存成功后，调用 1 次 `get_custom_page_structure(appId, page_id: pageId, detail: "summary")` 检查 48 列栅格坐标、左右组合顶底边对齐、容器坐标空间与组件重叠（无需读 `full`）。
+3. **按需一轮局部校正**：若摘要显示存在重叠、错位或多余装饰容器遮挡，调用 `patch_custom_page_components`（仅传真实 `componentId`、原 `componentType`、位置/尺寸/父级差异及最新 `version`，省略 `config`）做一轮局部校正后再读一次 `summary` 核实收口。
 
 ---
 
-## 三、 单页面执行 SOP 流水线
+## 三、 本地回执落盘契约
 
-### 1. 批量创建统计图表 (Charts)
-遍历切片中的图表规划：
-1. **数据源字段映射**：直接从切片的 `worksheetContextSlice` 提取维度与指标字段的真实 `controlId`；
-2. **调用 MCP 创建图表**：调用 `create_chart`：
-```json
-{
-  "appId": "<appId>",
-  "worksheetId": "<worksheetId>",
-  "name": "本月各部门销售额对比",
-  "reportType": "bar",
-  "xaxes": { "controlId": "biz_dept" },
-  "yaxisList": [{ "controlId": "biz_amount", "normType": 1, "alias": "销售额" }]
-}
-```
-记录返回的图表 ID（`reportId`）。
-
-### 2. 编排页面组件布局 (update_custom_page)
-页面采用 **48 栅格系统**（`x + w <= 48`）。直接使用切片中的 `contextSlice.pageId`，组装包含顶部筛选组、统计图表、视图嵌入与按钮等组件的完整数组，调用 `update_custom_page`：
-
-> [!CAUTION]
-> **filtersGroup ID 规则（避坑关键）**：
-> - **外层 `config.filtersGroupId`**：**新建筛选组必须留空或完全不传**（由服务端自动生成；若传入自定义 UUID 会报 430001 错误）；
-> - **内层 `filters[].filterId`**：**必须传入生成的 36 位 UUIDv4**（服务端强校验非空）。
+执行完成后，将标准回执写入 `receiptPath`（`.build/receipts/step6-page-{name}.json`）：
 
 ```json
 {
-  "appId": "<appId>",
-  "page_id": "<pageId>",
-  "components": [
-    {
-      "componentType": "filtersGroup",
-      "position": { "x": 0, "y": 0, "w": 48, "h": 4 },
-      "config": {
-        "filters": [
-          {
-            "filterId": "c8b1a234-5678-4901-abcd-ef0123456789",
-            "filterDataType": "Option",
-            "dataType": 11,
-            "controlId": "<statusControlId>",
-            "name": "业务状态",
-            "filterType": 2,
-            "advancedSetting": { "direction": "2", "allowitem": "1" },
-            "objectControls": [
-              {
-                "objectId": "<chartObjectId>",
-                "type": 1,
-                "worksheetId": "<worksheetId>",
-                "controlId": "<statusControlId>"
-              }
-            ]
-          }
-        ]
-      }
-    },
-    {
-      "componentType": "chart",
-      "name": "本月各部门销售额对比",
-      "position": { "x": 0, "y": 4, "w": 24, "h": 8 },
-      "config": {
-        "worksheetId": "<worksheetId>",
-        "objectId": "<chartObjectId>",
-        "chartType": "barChart",
-        "dataScope": "all",
-        "dimension": [{ "field": "<deptControlId>" }],
-        "values": [{ "field": "<amountControlId>", "aggregation": "SUM" }]
-      }
-    }
-  ]
-}
-```
-
----
-
-## 四、 输出交付物契约 (.build)
-
-执行成功后，将当前页面配置的图表与标准回执写入独立任务回执文件：
-- **文件路径**：`.build/receipts/step6-page-{targetPage}.json`
-- **内容格式**：
-```json
-{
-  "taskId": "step6-page-{targetPage}",
-  "executor": { "kind": "subagent", "agentId": "{agentId}" },
+  "taskId": "<来自 taskContext.taskId>",
+  "runId": "<runId>",
+  "executor": { "kind": "subagent", "agentId": "<agentId>" },
   "step": "6",
-  "target": { "type": "page", "name": "{targetPage}" },
+  "target": { "type": "page", "id": "<pageId>", "name": "<pageName>" },
   "status": "succeeded",
   "outputs": {
-    "pageName": "{targetPage}",
-    "pageId": "page_id_1",
-    "chartsCreated": [
-      { "name": "本月各部门销售额对比", "reportId": "rep_id_1" }
-    ]
+    "pageName": "<pageName>",
+    "pageId": "<pageId>",
+    "completed": true,
+    "notes": []
   },
   "verification": {
     "passed": true,
-    "evidence": ["各图表根据 create_chart 返回成功捕获 reportId，update_custom_page 成功更新页面布局"]
+    "evidence": ["已调用 update_custom_page 保存组件树并通过 summary 回读核对布局"]
   },
   "issues": []
 }
 ```
-
----
-
-## 五、 ⛔ 验证断言与错误自愈
-
-1. **断言 1 (图表全量创建)**：所有规划的统计图表均调用 `create_chart` 创建成功且记录 `reportId`；
-2. **断言 2 (页面更新成功)**：调用 `update_custom_page` 响应 `success: true`；
-3. **断言 3 (回执通知)**：将包含 `chartsCreated` 的标准回执写入 `.build/receipts/step6-page-{targetPage}.json`；
-4. **自愈机制**：若 `update_custom_page` 报 430001 错误，检查 `filtersGroupId` 是否为空。

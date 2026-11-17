@@ -1,556 +1,162 @@
-# HAP 已有应用修改实战手册
+# HAP 已有应用修改实战手册（12 领域增量操作卡）
 
-本手册只维护 Modify 场景的对象关联影响、对象特有规则和高风险案例。
-
-- 完整执行顺序以 `workflows/modify.md` 为准；
-- 安全门禁以 `modify/safety-rules.md` 为准；
-- 复杂操作执行边界以 `modify/execution-boundaries.md` 为准；
-- 底层参数以对应的 `references/spec-*.md` 为准。
-
-定位目标资产后、执行修改前，读取第 1 章和实际受影响对象章节。案例只展示操作骨架，不可复制其中的示例 ID。
-
-## 目录
-
-1. [使用方法](#1-使用方法)
-2. [应用信息与导航](#2-应用信息与导航)
-3. [工作表与字段](#3-工作表与字段)
-4. [视图与自定义动作](#4-视图与自定义动作)
-5. [业务规则](#5-业务规则)
-6. [打印模板](#6-打印模板)
-7. [自定义页面与图表](#7-自定义页面与图表)
-8. [工作流](#8-工作流)
-9. [角色与权限](#9-角色与权限)
-10. [数据修改、结构重构与迁移](#10-数据修改结构重构与迁移)
+本手册按 12 个标准修订领域沉淀线上执行器在底层参数规格（`references/hap-domain-*-spec.md`）之外的**读写顺序、增量/全量保护与防坑规则**。执行任务时由 `scripts/resolve_context.py --mode modify --assets ... --render` 按命中领域动态提取对应章节，无需通读全文。
 
 ---
 
-## 1. 使用方法
+## 1. 通用内联执行方法
 
-### 1.1 阅读时机
-
-先读目标章节的“关联影响检查”，再读取实时对象、实际直接依赖、修改规则和对应参数规范。Agent 在当前会话中维护影响结论、真实 ID、预期差异和验证断言，不要求生成预执行文件。Guide 决定需要检查的方向，但不得据此固定扫描整个应用。
-
-### 1.2 通用依赖影响关卡
-
-修改任何对象时，先从目标对象向外检查以下六类影响，再进入对应章节的专属清单：
-
-| 检查方向 | 需要确认的内容 |
-|---|---|
-| 对象本身 | 完整实时结构、稳定 ID、未修改属性和当前版本 |
-| 传入引用 | 哪些视图、规则、动作、页面、流程、权限或外部系统正在使用它 |
-| 传出引用 | 它读取、计算、展示、写入或跳转到哪些对象 |
-| 数据影响 | 历史记录、选项旧值、关联数据、统计口径和审计追溯 |
-| 运行影响 | 当前发布流程、持续写入、在线业务窗口和重复执行风险 |
-| 恢复与验证 | 是否能回读、如何断言、失败后如何恢复或保留旧结构 |
-
-“关联影响检查”始终以当前章节对象为起点；其他对象变化后如何修改它，只写在“修改规则”中。
-
-新增普通非敏感字段默认继承工作表现有权限，不要求读取全部角色。新增敏感字段、视图、自定义动作、打印模板、页面或明确权限变化时，按 `MOD-PERM-001` 检查相关角色与入口；具体权限模型和写入方法只在第 9 章及 `references/spec-roles-permissions.md` 维护。
-
-物理删除、稳定标识变更、字段类型变化、数据迁移、数据源切换和已发布工作流调整还要读取 `modify/execution-boundaries.md`。未知依赖不得记为无影响；影响不可逆且无法确认时阻断执行。
-
-### 1.3 分开记录必要性和执行方式
-
-每个影响都要分别判断，不要把“是否必须修改”和“由谁执行”混为一类：
-
-| 维度 | 可选值 | 当前会话处理 |
-|---|---|---|
-| 必要性 | 必须修改、可选推荐、无需修改、尚未确认 | 决定是否进入实际写入范围 |
-| 执行方式 | 自动、协同、人工、阻断、不适用 | 决定本轮如何完成及是否停止 |
-
-必要但只能人工完成的事项要说明责任人、路径、操作指导和完成标准；高风险或跨轮次时写入轻量执行日志。推荐项只向用户展示，用户选择前不得执行。
-
-### 1.4 各章节阅读顺序
-
-```text
-本对象变更的关联影响检查 → 制定方案前读取 → 写入规则 → 回读验证 → 实战案例（按需）
-```
-
-### 1.5 写入批次原则
-
-物理 MCP 写入批次不等于业务描述中的每个修改点。先排除 `no_change`，再按“写入工具 + 父对象 + 执行阶段”合并兼容变化；一次批量写入只做一次能覆盖全部断言的精准回读。
-
-| 场景 | 默认合并方式 |
-|---|---|
-| 同一工作表的多个字段增改 | 合并为一次 `update_worksheet`；删除放在迁移验证后的清理阶段 |
-| 同一工作表的多个自定义动作 | 合并为一次 `create_custom_actions` |
-| 同一视图的字段、筛选、排序和动作挂载 | 合并为一次 `update_view` |
-| 同一角色的字段、视图、动作、模板等权限差异 | 取得本次所有新对象 ID 后，合并为一次完整 `update_role` |
-| 多条记录写入相同字段值 | 使用运行时批量记录接口；不同映射值分批 |
-| 同一流程的兼容节点变化 | 运行时支持且无未解析的新 ID 依赖时批量写入，最终统一校验和发布 |
-| 打印模板自身属性与适用视图 | 在创建或更新模板时一并提交，不再追加一次相同对象更新 |
-
-需要前序结果生成真实 ID、处于不同风险阶段、涉及数据迁移前后顺序或包含破坏性清理时，保持独立批次，不为减少调用强行合并。
+1. **最少往返原则**：已有可靠目标 ID 时按 ID 直达所需配置，不再查列表证明存在；同表多字段点读合并调 `get_worksheet_field`，互不依赖的只读查询同轮并发发出；同一父对象的兼容变更合并为一次物理写入。
+2. **只改批准差异**：不将用户未提及的属性自动重置为默认值，也不顺带优化无关字段、布局、图标或权限。需自动挑选图标且用户未要求平台默认时，加载 `references/hap-icon-palette.md` 选取带 `sys_` 前缀的合法 `fileName`。
+3. **跨步骤真实 ID 衔接**：多领域连带任务（如新建表 → 翻新默认视图 → 导航收尾 → 角色授权）严格串行使用前一步真实返回的 ID，严禁传入占位符或凭同名猜测。
 
 ---
 
-## 2. 应用信息与导航
+## 2. 应用与导航 (`app_navigation`)
+<!-- SOURCE: modify-app/app-navigation-revision-sub-agent.yaml -->
 
-应用和导航的可用接口、参数及返回结构以当前运行时 MCP 工具为准。
-
-### 2.1 本对象变更的关联影响检查
-
-| 本对象的变更 | 向外检查的对象或影响 | 默认处理 |
-|---|---|---|
-| 修改应用名称、图标或说明 | 用户入口、分享识别、外部文档和集成配置 | 应用内配置通常无需连带修改；外部引用无法自动确认时形成核对项 |
-| 调整工作表、页面或分组顺序 | 导航层级、角色可见范围和常用入口 | 导航目标必须保持有效；纯顺序优化为推荐 |
-| 移动对象到其他分组 | 分组是否存在、同名对象识别和角色使用路径 | 路径变化必须展示，引用仍使用稳定 ID 时记录无需修改 |
-| 隐藏或删除导航对象 | 页面入口、角色首页、分享链接和工作流跳转 | 隐藏前说明访问变化；删除必须通过依赖关卡 |
-
-### 2.2 修改规则
-
-#### 制定方案前读取
-
-- 读取应用实时信息、全部导航对象、分组和排序；
-- 核对名称相近对象的真实 ID，避免按名称猜测；
-- 删除或替换入口时检查角色首页、页面组件、动作和流程跳转。
-
-#### 写入规则
-
-- 只修改用户要求的应用属性或导航位置，保留未涉及的主题、图标和对象顺序；
-- 调整排序时提交完整目标顺序，确保没有遗漏或重复对象；
-- 优先隐藏、下沉或迁移入口；物理删除必须作为独立高风险批次处理。
-
-#### 回读验证
-
-- 核对应用属性、分组归属和全量排序；
-- 核对每个导航对象仍然唯一存在；
-- 核对角色可见入口和关键跳转仍然有效。
+- **推荐精确工具集**：`get_app_info`、`get_worksheet_structure`、`get_custom_page_structure`、`get_chatbot_details`、`update_app`、`update_app_maintenance`、`update_app_items`、`create_app_sections`、`update_app_section`、`delete_app_section`、`sort_app_sections`、`sort_app_items`、`move_app_items`
+- **参考规格**：`references/hap-domain-app-spec.md`、`references/hap-icon-palette.md`
+- **读写与保护规则**：
+  - **应用项属性与 `remark/desc` 统一入口**：仅修改工作表、自定义页面或 AI 助手的导航名称、图标、`displayType`、简要备注（`remark`）或用户说明（`desc`）时，跨类型混合去重合并为一次 `update_app_items` 提交（不传 `sectionId`）；`name/icon` 传空串保持原值，`remark/desc` 传空串表示清空（仅在明确要求清空时传）。注意区分：工作表改导航名会同步实体名，页面与助手只改导航名；局部追加说明时先按类型点读原说明保留未改部分。
+  - **跨组移动与组内排序分离**：跨分组移动已有项必须用 `move_app_items(appId, sectionId, itemIds)` 原生原子移动，**严禁删分组重建**；`sort_app_items` 仅用于同分组内全量已有项重排（新建收尾默认页面在前、工作表在后，主表在前、明细子表紧随其后；当前顺序已满足则跳过不调）。
+  - **分组排序与删除**：`sort_app_sections` 必须传入实时读取的全量同级分组 ID 数组；删除分组严格按 `references/hap-domain-app-spec.md` 的层级承接参数执行，保留全部应用项。
+  - **维护模式与应用属性**：`update_app_maintenance` 明确启停直接执行，仅改提示文案且状态未知时先查一次，不为改文案擅自开启维护；`update_app` 只传批准差异，未经要求严禁触碰既有 `navLayout`/`navColor`/`icon`/`color`。
+- **验证要点**：检查 `update_app_items` 的 `successCount / updatedIds / skipped`；若修改了 `displayType`，回读对应导航项 `status` 确认生效。
 
 ---
 
-## 3. 工作表与字段
+## 3. 工作表、字段、规则、索引与筛选器 (`worksheet`)
+<!-- SOURCE: modify-app/worksheet-revision-agent.yaml -->
 
-参数规范：`references/spec-worksheets.md`。
-
-### 3.1 本对象变更的关联影响检查
-
-| 本对象的变更 | 向外检查的对象或影响 | 默认处理 |
-|---|---|---|
-| 新增字段 | 表单布局 | 完成字段创建不可缺少，纳入必要操作 |
-| 新增字段 | 主列表和其他视图的展示、筛选、排序、分组 | 用户明确要求或目标依赖时为必要，否则为推荐 |
-| 新增字段 | 业务规则、自定义动作、工作流、页面图表 | 业务目标依赖时为必要，否则为推荐 |
-| 新增字段 | 所有现有角色的字段权限 | 默认随工作表权限对角色可用；敏感字段必须从不应访问的角色移除 `read` 或 `edit`，普通字段检查后可记录无需修改 |
-| 修改字段别名 | Formula、Lookup、Rollup、工作流和外部集成引用 | 已引用对象必须同步；无法核对的外部引用形成待办并提高风险 |
-| 修改选项 | 视图筛选/分组、规则条件、流程分支、图表分类 | 引用原选项时必须同步 |
-| 修改字段类型 | 所有读取、计算和写入该字段的对象 | 必须同步并按高风险处理 |
-| 隐藏或删除字段 | 表单、视图、规则、动作、流程、页面图表和权限 | 隐藏前说明影响；删除前必须核对并确认全部必要连带修改 |
-| 新增 Relation/SubTable | 表单布局、反向关系、Lookup/Rollup、视图、权限和历史迁移 | 完成目标不可缺少的结构为必要，其余为推荐；迁移能否自动执行另行判断 |
-
-例如，用户只要求“给报销单加一个加急支付字段”时，字段和表单布局属于必要操作；加急必填规则、待打款视图置顶和加急通知属于推荐项。若用户明确补充“让财务在待打款列表优先看到”，则对应视图展示和排序改为必要操作。
-
-### 3.2 修改规则
-
-#### 制定方案前读取
-
-- 调用 `get_worksheet_structure` 获取工作表和目标字段的完整实时定义；
-- 检查视图、业务规则、公式、Lookup、Rollup、图表和工作流对目标字段的直接引用；
-- 新增字段时读取现有别名和最大 `layout.rowIndex`；
-- 新增字段时先判断是否敏感；只有敏感字段或明确权限变化时，才读取拥有该工作表访问权的相关角色及其 `fieldPermissions`；
-- 修改选项时确认用户目标是“停止未来选择”还是“统一历史值”。
-
-#### 写入规则
-
-- 同一工作表中互不冲突的 `addFields` 和 `editFields` 合并为一次 `update_worksheet`；`removeFields` 必须在依赖切换和数据验证完成后作为清理批次执行；
-- 新增字段使用 `addFields`；会被公式、汇总或工作流引用时分配稳定、唯一的语义别名；
-- 新增普通字段不需要为每个角色重复添加权限；新增敏感字段时，先创建并回读真实 `fieldId`，再把限制角色的 `fieldPermissions` 作为必要连带修改排在字段创建之后；
-- 修改已有字段使用 `editFields`，提交从实时结构复制得到的完整字段对象，只改变目标属性；
-- 重点保留 `type`、`alias`、`options`、`config`、`layout`、`defaultValue`、`required`、`isTitle`、`isHidden` 和 `precision`；
-- 新增 Relation 或 SubTable 时直接使用实时获取的目标 `worksheetId`；Relation 需要双向关联时只在一侧主动声明；
-- 停止未来选择旧选项时移除可选配置并保留历史旧值；合并或替换历史值时先迁移记录，再移除旧选项；
-- 废弃有历史数据的字段时优先隐藏；物理删除必须执行高风险确认。
-
-#### 回读验证
-
-- 核对目标属性已生效；
-- 核对所有受保护属性未被重置；
-- 核对标题字段仍然唯一；
-- 核对关联目标、公式表达式、Lookup 来源和 Rollup 汇总方式仍然有效；
-- 敏感字段逐个回读受影响角色，确认无权角色不可读或不可编辑、授权角色仍可使用；普通字段记录角色权限已经检查且无需额外覆盖；
-- 核对直接依赖已同步，或已经记录为未完成待办。
-
-### 3.3 案例：安全修改字段属性
-
-**目标**：将 `记账金额` 改为必填，并将排版从半行调整为整行。
-
-1. 读取 `记账金额` 的完整字段对象；
-2. 复制完整对象，只修改 `required: true` 和 `layout.span: 12`；
-3. 将完整对象放入 `editFields`；
-4. 回读断言目标属性生效，且 `type`、`alias`、`precision`、`config`、`options` 和 `isTitle` 未改变。
-
-字段完整对象和 payload 参数以 `references/spec-worksheets.md` 为准，不在 Guide 重复列出。
-
-### 3.4 案例：停用或合并选项
-
-- 仅停止未来选择 `已取消`：移除该选项并保留历史旧值，不迁移记录。
-- 将 `待初审`、`待复审` 合并为 `待审批`：先追加新选项，再按下列顺序处理历史数据。
-
-```text
-查询旧值记录
-→ 展示数量并确认
-→ 批量更新为“待审批”
-→ 回读确认旧值记录数为 0
-→ 移除旧选项
-→ 同步视图、规则、流程和图表
-```
+- **推荐精确工具集**：`get_app_worksheets_list`、`get_worksheet_structure`、`get_worksheet_field`、`get_worksheet_settings`、`create_worksheet`、`update_worksheet`、`update_worksheet_settings`、`delete_worksheet`、`get_worksheet_filter_list`、`get_worksheet_filter`、`save_worksheet_filter`、`delete_worksheet_filter`、`get_business_rule_list`、`get_business_rule_detail`、`create_business_rule`、`update_business_rule`、`delete_business_rule`、`get_worksheet_index_list`、`create_worksheet_index`、`update_worksheet_index`、`rename_worksheet_index`、`delete_worksheet_index`
+- **参考规格**：`references/hap-domain-worksheet-spec.md`、`references/hap-domain-custom-field-spec.md`、`references/hap-domain-business-rule-spec.md`、`references/hap-domain-worksheet-index-spec.md`
+- **读写与保护规则**：
+  - **概览与布局读取选型**：仅需字段与视图概览时用 `get_worksheet_structure(responseFormat: "md")`；涉及表单排版布局设计或核验时直接用 `responseFormat: "dsl"`（已有完整 DSL 时直接复用，不再补读 MD）；点读单字段原配置用 `get_worksheet_field`。
+  - **新建工作表闭环**：调用 `create_worksheet` 时使用真实 `sectionId`，**禁止传入 `createDefaultView: false`**（必须保留默认视图，拿回真实 `worksheetId` 与 `defaultViewId` 供后续原地翻新）；图标必带 `sys_` 前缀；同表配套的表单业务规则（`create_business_rule`）与物理索引（`create_worksheet_index`）紧接完成。
+  - **单任务新增/编辑账本铁律**：`update_worksheet.addFields` 成功创建字段后，若后续仍需微调该字段属性，**必须改用 `editFields` 并传真实字段 `id`/`fieldId`**，严禁对已建字段再次发 `addFields` 撞别名唯一约束；新字段 `alias` 带 `biz_` 前缀。
+  - **新增字段语义就近排版**：未指定位置时，按业务分段、相关字段与录入动线就近插入并协调同行 `span`（不把“未指定位置”机械等同于“塞到表单最末尾”），保留其他未受影响字段的相对顺序。
+  - **主从子表与跨表衍生顺序**：建子表（`displayType: 2`）先于主表 `SubTable` + `showFields` + `Rollup`；多表双向关联先建主动关联使服务端生成真实反向字段后，再写引用反向关联的 `Lookup/Rollup`。已有子表新增字段时，同步将新字段补入主表对应 `SubTable` 的 `showFields`。
+  - **专项能力要点**：① `CustomField`（`type: 48`）必读 `references/hap-domain-custom-field-spec.md`，`customWidget.script` 为无 import 纯函数源码（禁带 Markdown 代码围栏），引用的真实 `controlId` 全量声明在 `reference` 数组；② 业务规则停用须先读完整详情保留条件和动作，仅改 `enabled: false`；③ 索引仅改名使用 `rename_worksheet_index`；④ 工具栏漏斗已保存筛选器使用 `save_worksheet_filter` / `delete_worksheet_filter`（勿与视图筛选混淆）。
+- **验证要点**：布局调整与全量数组替换在最后一次写入后用 `dsl` 或对应详情接口集中核对一次；索引构建异步受理如实报告“已提交构建”。
 
 ---
 
-## 4. 视图与自定义动作
+## 4. 视图与自定义动作 (`view_action`)
+<!-- SOURCE: modify-app/view-action-revision-sub-agent.yaml -->
 
-参数规范：`references/spec-actions-views.md`。
-
-### 4.1 本对象变更的关联影响检查
-
-| 本对象的变更 | 向外检查的对象或影响 | 默认处理 |
-|---|---|---|
-| 新增视图 | 所有现有角色的 `recordPermissionInViews` | 新视图默认不在角色权限中；必须明确需要使用的角色并显式加入真实 `viewId` |
-| 新增自定义动作 | 挂载视图、视图可用角色、动作显示条件、字段权限和行记录操作权限 | 动作默认不出现在任何视图；创建后必须挂载到需要使用的视图，并保证目标角色拥有视图及底层操作权限 |
-| 修改视图展示列、筛选、排序或分组 | 本表字段、选项值和快速筛选 | 引用发生变化时必须同步；纯展示增强为推荐 |
-| 重命名、替换或下沉视图 | 页面内嵌、角色专属视图、动作入口和工作流跳转 | 仍引用旧视图的对象必须同步 |
-| 删除视图 | 页面、角色、动作和工作流的全部已知引用 | 依赖未确认前禁止删除 |
-| 修改动作显示条件或填写字段 | 本表字段、选项、业务规则和字段权限 | 目标行为依赖时必须同步 |
-| 修改动作类型、工作流或入口参数 | 绑定工作流、触发参数和下游字段 | 两侧参数必须一致；无法核对时停止执行 |
-
-### 4.2 修改规则
-
-#### 制定方案前读取
-
-- 读取目标视图或动作的实时结构及本表字段；
-- 检查页面内嵌视图、角色专属视图、动作显示条件和绑定工作流；
-- 新增视图或动作时读取所有相关角色的视图、字段和行记录操作权限，并明确业务上需要使用它的角色；
-- 新增动作时先确定要挂载的视图及挂载位置：详情操作 `detailActions` 或快捷操作 `quickActions`；
-- 记录无法自动确认的页面、角色和工作流间接引用。
-
-#### 写入规则
-
-- 同一工作表的多个新动作使用一次 `create_custom_actions`；取得全部真实 `actionId` 后，每个受影响视图只执行一次合并后的 `update_view`；
-- 修改 `tableFields`、`filter`、`sort`、`quickFilters` 等配置段时，先从实时结构合并未修改内容；
-- 修改动作时同时核对名称、显示条件、填写字段、动作类型和工作流绑定；
-- 新增视图后回读真实 `viewId`，只向确实需要使用的角色追加到 `recordPermissionInViews`，更新时保留这些角色已有的其他视图权限；
-- 新增动作后回读真实 `actionId`，再更新每个必要视图的 `detailActions` / `quickActions`；同时确保目标角色拥有挂载视图、动作使用字段及所需行记录操作权限；
-- 视图收敛时先创建替代视图并调整排序，旧视图先下沉，不直接删除。
-
-#### 回读验证
-
-- 核对视图类型、展示列、筛选、排序、快速筛选和分组字段；
-- 核对动作显示条件、填写字段及绑定流程；
-- 新增视图时逐个回读目标角色，断言新 `viewId` 已加入；未授权角色不得被误加；
-- 新增动作时逐个回读必要视图，断言 `actionId` 已挂载在正确位置，并核对目标角色能够访问这些视图；
-- 核对页面和权限引用已经切换，或已形成明确待办。
-
-### 4.3 案例：新增动作并挂载到目标视图
-
-**目标**：新增“提交主管审核”动作，只供销售人员在“我的待提交”视图使用。
-
-1. 读取动作所需字段、绑定工作流、“我的待提交”视图和销售角色权限；
-2. 创建动作并回读真实 `actionId`；
-3. 将动作挂载到“我的待提交”视图的 `quickActions`，不添加到其他视图；
-4. 确认销售角色的 `recordPermissionInViews` 包含该视图，并拥有动作所需字段和记录操作权限；
-5. 回读动作、视图和销售角色，验证挂载位置、显示条件、流程绑定和实际可用范围。
-
-### 4.4 案例：安全删除旧视图
-
-**目标**：新看板已经替代“待处理旧列表”，删除旧视图。
-
-1. 将目标标记为 `assets=view`、`scenarios=physical_delete`，在制定方案前加载执行边界；
-2. 读取旧视图、新看板、页面内嵌、角色专属视图、动作入口和工作流跳转；
-3. 把仍指向旧视图的必要引用切换到新看板，并逐项回读；
-4. 对无法自动反查的分享链接和外部入口形成明确人工核对项；
-5. 依赖、恢复依据和高风险确认齐备后执行删除；回读断言旧视图不存在，替代视图和已切换引用仍有效。
+- **推荐精确工具集**：`get_worksheet_structure`、`get_view_structure`、`create_view`、`update_view`、`delete_view`、`sort_views`、`get_custom_action_list`、`create_custom_actions`、`update_custom_action`、`delete_custom_action`
+- **参考规格**：`references/hap-domain-view-spec.md`、`references/hap-domain-custom-action-spec.md`
+- **读写与保护规则**：
+  - **默认「全部」视图原地翻新铁律**：新表配套视图或整套视图设计必须保留初始 `defaultViewId` 的身份，通过 `update_view` 原地完善展示列、排序、快捷筛选、分类导航或着色（保持全量浏览用途，不加缩小范围的预设 `filter`），**严禁另建同用途视图或删成 0 视图**。局部修改其他视图时不连带重做默认视图。
+  - **视图创建与位置排序**：多个新视图合并放入一次 `create_view.views` 数组；优先用创建接口位置参数一次到位，确需重排时调用 `sort_views` 传入本表**全量现有真实 `viewId` 数组**；局部隐藏视图中的某个动作按钮使用 `update_view` 保留其余按钮。
+  - **自定义动作与数据源切换**：`updateCurrentRecord` 的 `updateFields` 是让用户手填弹窗，若需求是一键自动赋值/流转必须选 `triggerWorkflow` 并接续配置关联流程；`recordScope`（单条/多条）创建后不可修改，确需切换时先只读备份原流程配置 → `delete_custom_action` 删旧动作 → 重建新动作并挂载视图 → 接续恢复权限与新关联工作流。
+- **验证要点**：回读比对着色/筛选字段时注意接口入参可用 `alias` 而回包可能返回 24 位字段 `id`，通过表结构映射等价即收口，不反复重写。
 
 ---
 
-## 5. 业务规则
+## 5. 角色、权限与成员 (`role_permission`)
+<!-- SOURCE: modify-app/role-permission-revision-sub-agent.yaml -->
 
-参数规范：`references/spec-business-rules.md`。
-
-### 5.1 本对象变更的关联影响检查
-
-| 本对象的变更 | 向外检查的对象或影响 | 默认处理 |
-|---|---|---|
-| 修改条件字段、操作符或选项值 | 字段类型、现有选项和同字段其他规则 | 引用必须有效；冲突规则必须同步处理 |
-| 修改显示、只读、必填或错误动作 | 表单行为、字段权限和可能同时命中的规则 | 业务目标依赖时为必要 |
-| 修改规则影响的字段 | 视图录入、动作填写项和工作流写入方式 | 会造成无法填写或提交时必须同步 |
-| 停用或删除规则 | 依赖该规则完成校验或引导的业务路径 | 行为变化必须说明；删除按风险确认 |
-
-### 5.2 修改规则
-
-#### 制定方案前读取
-
-- 读取目标规则、本表字段以及操作相同字段的其他规则；
-- 核对条件字段和动作字段真实存在；
-- 检查显示/隐藏、只读/可编辑、必填/非必填之间是否冲突。
-
-#### 写入规则
-
-- 保留未修改的条件组和动作项；
-- 不创建对同一字段互相矛盾且可能同时命中的规则；
-- 修改字段或选项后同步更新规则条件中的 ID 或选项值。
-
-#### 回读验证
-
-- 核对条件组逻辑、操作符、目标字段和执行动作；
-- 与其他规则联合检查冲突；
-- 对错误拦截规则验证提示内容和触发条件。
+- **推荐精确工具集**：`get_role_list`、`get_role_summary`、`get_role_worksheet_permission`、`get_role_details`、`find_member`、`find_department`、`create_role`、`update_role`、`sort_roles`、`add_member_to_role`、`remove_member_from_role`、`delete_role`
+- **参考规格**：`references/hap-domain-role-spec.md`
+- **读写与保护规则**：
+  - **新建角色一次闭环**：`create_role` 原生支持初始权限参数，必须一次提交角色信息与完整初始权限拿回 `roleId`（严禁先建空壳再调 `update_role`），紧接按需执行 `add_member_to_role` 与 `sort_roles`。
+  - **局部权限增量更新铁律**：调用 `update_role` 做局部修改时，**必须显式传 `isIncremental: true` 且显式保留原 `permissionScope`**（省略 `permissionScope` 会被重置为 `0`！）。单表权限修改先用 `get_role_worksheet_permission` 获取基线，合并批准的视图/字段/动作差异并原样回写未改项及三组关联扩展权限数组，严禁用空数组覆盖未知权限；视图权限不得超过 `recordDataScope`。
+  - **成员粒度与排序/删除**：添加成员前用 `find_member` / `find_department` 解析唯一真实 ID；移除成员必须匹配原加入粒度（部门/职位加入不可传个人 ID 移除），`operatorId` 传当前认证用户 ID（可通过 `get_current_user` 获取，不可猜测）；`sort_roles` 必须传全量可排序角色 ID。
+- **验证要点**：原生响应已确认变更时直接记账；全量替换或存在跨表覆盖风险时定向回读对应权限摘要核实旧权限未丢失。
 
 ---
 
-## 6. 打印模板
+## 6. 自定义页面与页面内图表 (`custom_page`)
+<!-- SOURCE: modify-app/custom-page-revision-sub-agent.yaml -->
 
-参数规范：`references/spec-print-templates.md`。
-
-### 6.1 本对象变更的关联影响检查
-
-| 本对象的变更 | 向外检查的对象或影响 | 默认处理 |
-|---|---|---|
-| 新增打印模板（业务阶段控制） | 视图适用范围（工作表现有视图） | 阶段性单据（如报销打印单、出库单）必须绑定业务流转通过后的指定视图（如「报销通过」或「已归档」视图），避免在草稿/处理中阶段误打；通用单据适用于所有记录 |
-| 新增打印模板（敏感权限控制） | 角色打印权限与视图访问权 | 普通模板默认对拥有该表打印权限的所有角色可用，无需逐角色修改权限；若涉及高管薪资、核心协议等敏感模板，需在角色的 `unablePrintTemplates` 中禁用或收缩视图访问权 |
-| 删除打印模板 | 工作流引用（如获取打印文件节点）、业务打印依赖和替代方案 | 依赖未确认前禁止删除；删除按风险确认 |
-
-### 6.2 修改规则
-
-#### 制定方案前读取
-
-- 读取工作表实时字段、别名、全部视图及已有角色的打印权限；
-- 明确模板是全表通用，还是必须绑定特定业务阶段（如「报销通过」视图）；
-- 删除模板前检查是否有工作流节点引用该模板。
-
-#### 写入规则
-
-- 模板名称、文件、适用范围、下载权限和在线编辑设置在同一次创建或更新中提交；不得先创建再为相同模板重复补写这些属性；
-- **业务阶段与视图绑定（Visibility）**：模板应符合业务流转阶段（如：报销单仅在「报销通过」视图可用，归档卡仅在「已结案」视图可用），指定视图时使用回读得到的真实 `viewId`；
-- **防篡改与安全参数（模板自身属性）**：严肃凭证、财务单据与归档卡片应在模板自身参数中禁用在线编辑（`allowEditAfterPrint: false`）并限制下载权限（`downloadPermission: "managers"`），防止单据被随意篡改；报价单等草案可开放下载；
-- **敏感角色权限收缩**：常规模板全员可用无需调整角色；仅对敏感模板（如薪资单、核心协议），在目标受限角色的 `unablePrintTemplates` 中填入其 ID 禁用，或收缩视图访问权；
-- **删除解除依赖**：删除前先解除工作流节点引用。
-
-#### 回读验证
-
-- 核对模板名称、格式、适用范围（绑定视图）与防篡改参数（下载权限与在线编辑）生效；
-- 适用于指定视图时逐个核对 `viewId` 和模板可见性；
-- 若涉及敏感模板收紧，回读目标角色确认权限隔离生效。
-
-### 6.3 案例：为已有工作表创建标准 Word 打印模板
-
-**目标**：为《图书》表新增《图书档案卡》Word 打印模板，并仅向管理员开放下载权限。
-
-1. 读取《图书》表字段与视图，核对模板占位符真实有效；
-2. 确定管理员和档案员是目标角色，模板只适用于【已读完】和【已归档】视图，而不是所有记录；
-3. 上传 Word 模板文件，使用两个视图的真实 `viewId` 配置适用范围，下载权限设为仅管理员；
-4. 为管理员和档案员开启 `recordActions.systemPrint`，并确认两类角色都拥有上述视图权限；
-5. 回读模板、指定视图和两个角色，核对模板可见性、打印权限和下载限制。
+- **推荐精确工具集**：`get_app_info`、`get_custom_page_structure`、`get_custom_page_component`、`get_custom_page_settings`、`create_app_items`、`patch_custom_page_components`、`update_custom_page`、`update_custom_page_config`、`update_custom_page_settings`、`delete_custom_page`、`update_chart`、`move_chart`
+- **参考规格**：`references/hap-domain-custom-page-spec.md`、`references/hap-chart-design-guide.md`、`references/hap-icon-palette.md`
+- **读写与保护规则**：
+  - **定制前端代码需求前置拦截**：若需求本质是需要后端/随机算法逻辑的定制交互页（如点击随机抽奖写库）且无真实外部 URL，直接说明需由网站开发能力承接，**严禁先建空白画布页面或用普通新建按钮冒充**。
+  - **外链页面分流 (`pageType: url`)**：新建外链页调 `create_app_items(type: "customPage", pageType: "url", url: ...)` 一次完成；修改外链地址、打开方式、标题栏及同页名称/图标/说明调 `update_custom_page_config` 增量提交，不走画布组件树接口，也不跨类型互转。
+  - **画布局部维护优先用补丁**：已有画布页面的组件增删改与布局调整默认先读 `get_custom_page_structure(detail: "summary")` 取组件身份、坐标与 `version`（需保留某组件原配置时点读 `get_custom_page_component`），合并为 1～20 项 `operations` 调用 `patch_custom_page_components`（同一 `componentId` 每批仅出现一次；纯移位/缩放省略 `config`；删除图表前同批先更新引用它的 `filtersGroup`）。仅新建空页首次填充或用户明确批准整页重做（且 `detail: "full"` 回读无裁剪）时才用 `update_custom_page` 全量写入。
+  - **页面设置、单图更新与跨页复制/移动**：页面背景/刷新/屏幕适配/分享开关用 `get_custom_page_settings` + `update_custom_page_settings`（带 `version`）；仅改页面内某张已有图表配置用 `update_chart`（必传真实 `customPageId`、`worksheet_id`、`chart_id`，严禁调 `create_chart`）；将工作表或页面已有图表复制/移动到目标页面使用 `move_chart`（仅明确从 A 页移到 B 页时用移动模式；若要求“把工作表图移入页面并删原图”，先 `move_chart` 复制到页面拿新身份，再走 `worksheet_chart` 调 `delete_chart` 删原图）。
+  - **数值卡片图标铁律**：`icon.icon` 必须从 `references/hap-icon-palette.md` 选取带 `sys_` 前缀的合法名称，严禁使用无前缀示例值。
+- **验证要点**：新建/重建页面或增删调整组件布局后，必须调一次 `get_custom_page_structure(detail: "summary")` 检查重叠、错位与同排对齐，有问题用 `patch_custom_page_components` 做一轮局部校正。
 
 ---
 
-## 7. 自定义页面与图表
+## 7. 工作表统计图 (`worksheet_chart`)
+<!-- SOURCE: modify-app/worksheet-chart-revision-sub-agent.yaml -->
 
-参数规范：`references/spec-pages-charts.md`。
-
-### 7.1 本对象变更的关联影响检查
-
-| 本对象的变更 | 向外检查的对象或影响 | 默认处理 |
-|---|---|---|
-| 修改页面布局或组件尺寸 | 同区域组件位置、可见性和交互入口 | 发生重叠或遮挡时必须同步 |
-| 替换内嵌视图或数据源 | 视图、工作表、页面筛选和角色访问范围 | 引用及权限必须有效 |
-| 修改图表维度、指标或过滤 | 字段类型、选项值、聚合方式和页面联动 | 数据口径依赖时必须同步 |
-| 删除组件、图表或页面 | 导航入口、分享链接、角色首页和其他页面引用 | 依赖未确认前禁止删除 |
-
-### 7.2 修改规则
-
-#### 制定方案前读取
-
-- 读取页面布局、组件列表、数据源工作表、内嵌视图和图表；
-- 确认被引用的 `worksheetId`、`viewId` 和图表字段真实有效；
-- 字段或视图变化时检查所有受影响组件。
-
-#### 写入规则
-
-- 修改布局或组件列表时保留未修改组件，避免位置重叠和引用丢失；
-- 替换内嵌视图时同步更新组件的数据源引用；
-- 图表维度、指标或过滤字段变化时同步更新图表配置。
-
-#### 回读验证
-
-- 核对组件数量、类型、位置、尺寸和数据源；
-- 核对图表维度、指标和过滤条件；
-- 核对页面仍引用有效视图和图表。
+- **推荐精确工具集**：`get_chart_list`、`get_chart_details`、`get_worksheet_structure`、`get_view_structure`、`create_chart`、`update_chart`、`update_chart_owner`、`move_chart`、`sort_charts`、`delete_chart`
+- **参考规格**：`references/hap-domain-worksheet-chart-spec.md`、`references/hap-chart-design-guide.md`
+- **读写与保护规则**：
+  - **严格区分归属**：本领域仅处理工作表「统计」面板中的图表（调 `update_chart` 时不传 `customPageId`）；在本表统计列表内复制图表副本使用 `move_chart` 复制模式且不传 `targetPageId`；公共与个人图表切换使用 `update_chart_owner`；`sort_charts` 必须包含本表全部图表 ID。
+  - **类型切换与清空语义**：切换 `chartType` 会清理旧类型专属配置，须先读 `get_chart_details` 再按新类型组装兼容配置一次提交；`get_chart_details` 返回的 `filter` 不可原样回传，修改筛选须按输入 Schema 重构，清空筛选传 `{}`，清空说明传 `""`，禁传 `null` 或只读字段 `isPublic`。
 
 ---
 
-## 8. 工作流
+## 8. AI 智能助手 (`chatbot`)
+<!-- SOURCE: modify-app/chatbot-revision-sub-agent.yaml -->
 
-参数规范：`references/spec-workflows.md`；业务设计按需读取 `references/guide-workflows.md`。
-
-### 8.1 本对象变更的关联影响检查
-
-| 本对象的变更 | 向外检查的对象或影响 | 默认处理 |
-|---|---|---|
-| 修改触发源、触发字段或过滤条件 | 来源表字段、选项值、触发频率和重复执行风险 | 触发语义变化时必须同步并提高风险 |
-| 修改分支条件或节点连接 | 上游出口、下游入口和所有可达路径 | 连接和引用必须同步 |
-| 修改写入字段或字段值 | 下游字段类型、业务规则、视图和后续流程 | 类型或业务语义不一致时必须同步 |
-| 修改审批人、通知人或模板变量 | 角色、人员、部门和来源字段 | 无效接收人或变量必须同步 |
-| 删除、替换或重排节点 | 分支连接、后续节点和当前草稿 | 全部依赖确认后才可执行 |
-| 发布新版本 | 当前已发布版本、草稿校验结果和业务生效时间 | 校验与发布状态必须纳入必要验证 |
-
-### 8.2 修改规则
-
-#### 制定方案前读取
-
-- 读取当前已发布流程和草稿状态；
-- 核对触发源字段、节点引用、分支条件、审批人和下游写入字段；
-- 记录当前发布版本，区分已发布结构与待修改草稿。
-- 修改并重新发布线上流程时标记 `scenarios=published_workflow`，在制定方案前完成运行态边界判断。
-
-#### 写入规则
-
-```text
-修改草稿
-→ 核对节点连接和引用
-→ validate_process
-→ 校验通过后 publish_process
-→ 无法安全修正时 discard_workflow_draft
-```
-
-- 同一流程中无未解析 ID 依赖的兼容节点变化优先使用运行时批量接口；全部草稿变化完成后统一执行一次 `validate_process`，校验通过后只发布一次；
-- 不在校验失败时发布；
-- 不把放弃草稿描述为回滚已经发布的新版本；
-- 删除节点前检查分支连接和下游引用。
-
-#### 回读验证
-
-- 核对节点、分支、字段引用和审批人；
-- 核对校验结果及发布状态；
-- 核对不应变化的旧节点仍然存在。
-
-### 8.3 案例：增加金额审批分支
-
-**目标**：采购金额超过 10,000 元时增加总监审批。
-
-1. 读取当前流程、金额字段和审批人配置；
-2. 在草稿中插入金额条件分支和总监审批节点；
-3. 核对条件引用、分支出口和后续节点连接；
-4. 调用 `validate_process`；
-5. 校验通过后发布并回读发布状态；
-6. 校验失败且无法安全修正时放弃草稿，保持当前已发布版本不变。
+- **推荐精确工具集**：`get_chatbot_details`、`create_chatbot`、`update_chatbot`、`delete_chatbot`、`get_workflow_structure`、`get_workflow_node`、`update_workflow_node`、`validate_process`、`publish_process`、`get_app_ai_models`、`get_app_knowledge_list`
+- **参考规格**：`references/hap-domain-chatbot-spec.md`、`references/hap-icon-palette.md`
+- **读写与保护规则**：
+  - **创建参数白名单**：`create_chatbot` 必传 `name`、`prompt`、`welcomeMessage`、`presetQuestions`（1～5 项具体业务问题，用户明确要求为空才传 `[]`）及 `sys_` 前缀 `icon`；**严禁向 `create_chatbot/update_chatbot` 传 `model`、`worksheets`、`knowledgeBases`、`iconColor` 等不存在的参数**。
+  - **通过关联工作流修订助手核心行为**：底层 **`chatbotId == workflowId`**！修改已有助手的系统提示词（Prompt）、模型、绑定工作表/视图范围、知识库或输出结构，或为新建助手绑定数据资源时，直接以 `workflow_id: chatbotId` 调用 `get_workflow_structure(version: "draft")` 定位 `ai_agent` 节点 → 按需 `get_workflow_node` 读取保留既有 `toolId/fieldId` → 一次 `update_workflow_node`（`config` 必须为原生 JSON Object）合并提交 → 若目标已获上线发布授权则调 `publish_process`（未授权发布则保留草稿并明确说明“草稿已保存尚未发布生效”）。
 
 ---
 
-## 9. 角色与权限
+## 9. 打印模板 (`print_template`)
+<!-- SOURCE: modify-app/print-template-revision-sub-agent.yaml -->
 
-参数规范：`references/spec-roles-permissions.md`。
-
-### 9.1 角色或权限自身变更的关联影响检查
-
-| 本对象的变更 | 向外检查的对象或影响 | 默认处理 |
-|---|---|---|
-| 修改角色成员或数据范围 | 工作表、视图、自定义页面和动作权限 | 用户目标依赖时必须同步 |
-| 重命名、合并或删除角色 | 成员归属、流程审批人、负责人和分享范围 | 仍被引用时必须迁移；依赖不明时禁止删除 |
-| 修改角色专属视图或首页 | 目标视图、页面及导航有效性 | 引用失效时必须同步 |
-| 修改字段、视图、记录操作或打印权限 | 表单可用性、动作执行、打印入口和业务路径 | 权限组合导致目标角色无法完成业务时必须同步修正 |
-
-### 9.2 权限默认模型
-
-本节只说明权限对象应如何处理，不重复判断是哪个上游对象触发了权限调整。
-
-| 权限元素 / 新增对象 | 平台默认状态 | 修改与同步规则 |
-|---|---|---|
-| **新增工作表 (`worksheetPermissions`)** | 新工作表不会自动对普通角色开放完整数据与视图权限 | 回读真实 `worksheetId` 及各 `viewId`，向目标角色的 `worksheetPermissions` 追加该表配置（含 `recordDataScope`、`recordPermissionInViews` 及操作权限）；必须保留角色已有其他表的权限 |
-| **新增自定义页面 (`pagePermissions`)** | 新页面不会自动对非管理员角色可见 | 回读真实 `pageId` 后，向目标角色的 `pagePermissions` 数组追加 `{ id: pageId, enable: true }`，保留已有页面列表 |
-| **新增对话机器人 (`chatbotPermissions`)** | 新创建的 AI 助手不会自动对普通角色开放 | 回读真实 `chatbot_id` 后，向目标角色的 `chatbotPermissions` 数组追加 `{ id: chatbotId, enable: true }`，保留已有助手列表 |
-| `fieldPermissions` | 新字段对已经拥有工作表访问权的角色默认可用 | 普通字段通常无需逐角色覆盖；敏感字段从不应访问的角色移除读取或编辑权限 |
-| `recordPermissionInViews` | 新视图不会自动加入现有角色 | 回读真实 `viewId` 后，只向需要使用的角色追加，并保留已有视图列表 |
-| 自定义动作可用范围 | 挂载到视图后，默认对拥有该视图及记录权限的所有角色可用 | 普通动作无需逐角色配置；高危/敏感操作在目标角色的 `unableCustomButtons` 中填入其 ID 禁用 |
-| 打印模板可用范围 | 创建后默认随工作表打印权限对已有角色可用 | 普通模板无需逐角色配置；敏感模板在目标角色的 `unablePrintTemplates` 中填入其 ID 禁用，或通过模板自身限制下载（`downloadPermission: "managers"`）与指定视图（`specificViews`）收缩可用范围 |
-
-权限写接口及参数以当前运行时 MCP 定义为准。没有现有角色权限更新接口时，将必要调整转为结构化人工待办，不得标记为自动完成。
-
-### 9.3 修改规则
-
-#### 制定方案前读取
-- 调用 `get_role_list` 与 `get_role_details` 读取现有角色列表、成员、工作表、视图、自定义页面和 AI 助手访问范围；
-- 新增工作表、自定义页面、对话机器人、字段、视图、自定义动作或打印模板时，确定需要授权、维持默认或收紧权限的全部目标角色。
-
-#### 写入规则
-- 等待本次新增工作表、视图、动作、页面、机器人和打印模板的真实 ID 全部取得后，汇总同一角色的全部权限差异；每个受影响角色只执行一次完整 `update_role`，无实际差异的角色不得写入；
-- **`update_role` 全量覆盖铁律**：`update_role` 会根据请求体重新生成权限矩阵，未传入的权限项会被全部抹除。因此修改角色权限前，**必须先调用 `get_role_details` 读取完整配置，在已有 `worksheetPermissions`、`pagePermissions`、`chatbotPermissions` 数组基础上增量追加新对象后整体写回**，绝对禁止只传单一新增对象；
-- 当前运行时存在 `update_role` 或等价权限更新接口时，按其实时参数定义增量更新角色权限；接口不存在时转为结构化人工待办；
-- **新增工作表**：在 `worksheetPermissions` 中为目标角色配置行级范围 `recordDataScope`、视图列表 `recordPermissionInViews`、表与行操作权限 `worksheetActions`/`recordActions`；
-- **新增自定义页面 / 对话机器人**：在目标角色的 `pagePermissions` / `chatbotPermissions` 数组中追加 `{ id: 真实ID, enable: true }`；
-- **新增/修改敏感字段**：在目标角色的 `fieldPermissions` 中对普通角色设为 `read: false`（隐藏）或 `edit: false`（只读），对专员/管理角色开放编辑；
-- **禁用高危动作 / 敏感模板**：在受限角色的 `unableCustomButtons` 或 `unablePrintTemplates` 数组中填入需禁用的 `actionId` 或 `templateId`；
-- 新增视图时只向需要的角色追加真实 `viewId`；调整成员时调用 `add_member_to_role` 或 `remove_member_from_role`。
-
-#### 回读验证
-- 调用 `get_role_details` 回读断言目标工作表、页面、机器人、视图、字段、打印权限与黑名单（`unableCustomButtons`/`unablePrintTemplates`）准确生效；同时回读视图验证自定义动作挂载。
-
-### 9.4 案例：自动配置新增敏感字段权限
-
-**目标**：新增 `基本工资` 和 `绩效奖金` 后，自动收紧普通员工权限并授权薪酬专员。
-
-1. 新增字段后回读获取其 `fieldId`；
-2. 读取普通员工和薪酬专员的角色详情；
-3. 将普通员工对应字段设为不可读、不可编辑，将薪酬专员设为可读、可编辑，同时保留其他权限；
-4. 回读两个角色断言权限生效。运行时没有权限写接口时，将第 3 步转为必要人工待办。
+- **推荐精确工具集**：`get_worksheet_structure`、`get_print_template_list`、`get_print_template_details`、`create_system_print_template`、`update_system_print_template`、`create_qr_code_print_template`、`update_qr_code_print_template`、`create_barcode_print_template`、`update_barcode_print_template`、`create_file_print_template`、`update_file_print_template`、`replace_print_template_file`、`delete_print_template`
+- **读写与保护规则（含本地环境原生适配）**：
+  - **模板类型与更新范围**：复用已确认类型及配置，缺少时读取模板详情，使用对应类型的更新工具并保留 templateId。只提交批准差异，不用创建默认值覆盖原设置；不能为排版方便切换已有模板类型。
+  - **纯配置操作不碰文件**：系统打印、二维码、条码模板全程走各自 `create_*/update_*` 接口（读取 `get_print_template_details` 时省略 `importFile`；更新 `fields/relatedFields/showTexts` 数组时先读完整配置保留未改项和顺序）；Word/Excel 仅改名称、可见范围、下载权限或打印前编辑开关时直接调 `update_file_print_template`；删除指定模板（含 cloud）直接调 `delete_print_template`。
+  - **标签编码与访问**：二维码按已授权用途编码记录链接或真实字段，条码使用真实字段；纸张、标签布局、尺寸及显示文本组合按实时 Schema。打印二维码不隐含公开访问授权；空间不足先调整支持的布局，不通过换文件格式绕过编码限制。
+  - **文件模板制作与替换**：仅新建或替换 DOCX/XLSX 文件时，读取 [打印文件 step](steps/print_template.md)，按其中的本地文件流程、HAP 占位符与交付检查执行。纯配置和删除不加载文件制作内容。
 
 ---
 
-## 10. 数据修改、结构重构与迁移
+## 10. 工作表公开表单 (`public_form`)
+<!-- SOURCE: modify-app/public-form-revision-sub-agent.yaml -->
 
-先读取所有受影响资产章节；命中固定映射、批量更新、复杂转换、跨表迁移、依赖治理或物理删除时，再读取 `modify/execution-boundaries.md`。
+- **推荐精确工具集**：`get_worksheet_structure`、`get_worksheet_field`、`get_public_form_config`、`switch_public_form`、`update_public_form`、`update_public_form_settings`、`reset_public_form_fields`、`refresh_public_form_url`、`get_share_card_setting`、`update_share_card_setting`、`get_sms_signatures`
+- **读写与保护规则**：
+  - **独立配置对象边界**：工作表内部表单的 `form/submission` 与公开表单配置相互独立；仅查启停状态可复用工作表设置，查公开链接或详细配置直接调 `get_public_form_config`（分享卡片调 `get_share_card_setting`，`share_type: "public-form"`）。
+  - **启用即交付可用收集表**：首次启用先调 `switch_public_form` 初始化配置与链接，随即核对工作表结构，**仅公开收集目标所需且支持公开填写的字段，隐藏内部审批/流转字段**（切勿无脑全表公开；若隐藏必填字段导致无法提交，停止并汇报缺口，不擅改工作表字段约束）；设置清晰的标题、说明、提交按钮文案与匹配场景的 `coverPreset` 预设封面（`coverPreset` 与自定义 `coverImagePath` 互斥，切预设时不回传旧图片路径；Logo 默认沿用组织 Logo 不覆盖）。
+  - **更新与重置保护**：`update_public_form` 和 `update_share_card_setting` 仅传批准差异；**`update_public_form_settings` 会整组替换 `settings`**，必须先通过 `get_public_form_config` 取完整当前设置合并修改后提交（读取失败或截断时禁写）；`reset_public_form_fields` 仅在明确授权重置时使用；`refresh_public_form_url` 会废除旧链接，必须按 `high` 风险先经用户确认。明确关闭公开表单直接调 `switch_public_form`（保留已有配置与历史数据）。
 
-### 10.1 本次数据或结构变更的关联影响检查
+---
 
-数据和结构变更至少检查受影响表、字段、历史映射、视图、规则、动作、页面、流程、权限及外部集成，并分别记录必要性和执行方式。
+## 11. 外部用户门户 (`external_portal`)
+<!-- SOURCE: modify-app/external-portal-revision-sub-agent.yaml -->
 
-| 本次数据或结构变更 | 向外检查的对象或影响 | 默认处理 |
-|---|---|---|
-| 用户直接修改生产数据 | 记录范围、筛选条件、持续写入、审计要求和恢复依据 | 用户目标为必要；执行方式按数据量、确定性和验证能力判断 |
-| 同表固定值映射 | 唯一映射、异常值、受影响数量和字段引用 | 映射确定时为必要操作；命中 `fixed_value_mapping` 边界 |
-| 大批量数据更新或重算 | 批次、业务窗口、失败记录和对账口径 | 用户目标为必要；命中 `bulk_data_update` 边界并提高风险 |
-| 新旧结构并行 | 新业务写入入口、旧结构只读/隐藏和双写风险 | 切换闭环属于必要操作 |
-| 历史数据迁移 | 映射规则、数据量、异常记录和核对口径 | 业务要求保留历史时为必要；执行方式另行判断 |
-| 字段或表替换 | 所有读取、计算、展示、流程和权限引用 | 已知引用必须切换 |
-| 清理旧结构 | 历史保留、全局引用、恢复依据和用户确认 | 依赖未确认前禁止物理清理 |
+- **推荐精确工具集**：`get_org_detail`、`get_portal_status`、`get_portal_config_sections`、`switch_portal`、`patch_portal_config`
+- **参考规格**：`references/hap-domain-external-portal-spec.md`
+- **读写与保护规则**：
+  - **先开启后配置**：门户配置只能在开启状态下保存；同时包含批准的启用与配置时，先调 `switch_portal` 开启，再调 `patch_portal_config`。明确仅关闭门户按 `low` 直接执行（中断访问但保留用户和配置）。
+  - **局部递归合并与准入映射**：按需用 `get_portal_config_sections` 读取相关分组（局部改协议正文时传 `termsContent` 按篇读取）；`patch_portal_config` 为递归合并，只传批准差异，清空文本传 `""` 禁传 `null`；准入方式映射为仅邀请 `invite`、注册需审核 `approval`（配 `enableApproval: true`）、任何人可注册 `anyone`。
+  - **Logo 与背景素材优先级**：涉及美化或补齐外观时加载 `references/hap-domain-external-portal-spec.md`；未指定自定义 Logo 时先用组织 ID 调 `get_org_detail`，组织有真实 Logo URL 则直接用于 `appearance.logoSource`，否则再按行业匹配规范内置的七牛公网永久直链资产（禁传 SVG/WebP）。
 
-### 10.2 修改规则
+---
 
-#### 制定方案前读取
+## 12. 工作流 (`workflow`)
+<!-- SOURCE: modify-app/workflow-revision-sub-agent.yaml -->
 
-- 读取记录范围、数据量、持续写入状态、新旧结构、匹配键、字段映射、异常处理和验收口径；
-- 读取受影响的视图、规则、动作、页面、流程、权限和已知外部集成；
-- 命中执行边界时在方案形成前读取；无法反查的依赖必须记录为未知项。
+- **推荐精确工具集**：`get_workflow_list`、`get_workflow_structure`、`get_workflow_node`、`get_workflow_variables`、`create_process`、`delete_process`、`close_workflow`、`batch_create_process_nodes`、`batch_delete_process_nodes`、`update_workflow_node`、`update_workflow_info`、`update_workflow_variables`、`validate_process`、`publish_process`、`get_workflow_sms_templates`、`get_sms_signatures`、`find_member`、`find_department`、`get_current_user`
+- **参考规格**：`references/hap-domain-workflow-spec.md`、`references/hap-workflow-design-guide.md`
+- **读写与保护规则**：
+  - **设计与身份解析**：新建、重构或复杂分支/审批调整前先读 `references/hap-workflow-design-guide.md` 自检 7 个维度；仅改流程名/说明直接调 `update_workflow_info` 无需读整图或发布。固定姓名/部门用 `find_member`/`find_department`（`orgId` 传当前组织 ID，脱敏手机/邮箱不可用于外发）；“通知我”调 `get_current_user` 取真实用户 ID（勿与运行时动态触发人 `triggerUser` 混淆）；短信签名从 `get_sms_signatures` 有效结果中选取。
+  - **草稿增量修改与嵌套块分层处理**：新建普通流程用 `create_process(publish: false)` 拿 `processId/triggerAlias` 后调 `batch_create_process_nodes`（超长拓扑按几组完整依赖小组分批落盘）；自定义动作流程复用动作返回的 `workflowId` 先读真实触发 `nodeId`（不调 `create_process`，也不单独调 `delete_process` 删动作流）。修改已有节点用 `update_workflow_node` 最小 PATCH（**`config` 必须传原生 JSON Object，严禁序列化为字符串**；严禁把读取的整包 `config` 回写，严禁靠删全部下游节点修复普通参数错误；局部替换错误节点时换用新 `alias`）。`approval_block / sub_process / loop` 不展开内部节点，须以其内部 `processId` 分层调 `get_workflow_structure / update_workflow_node`，发布时**由内向外**先发布修改过的内部流程再发布父流程。
+  - **校验、发布与既有草稿保护**：复杂拓扑或仅交付草稿时调 `validate_process`，按 `issues` 的 `nodeId/path/hint` 定点修复；发布必须已获授权（注意核对是否存在任务外未发布草稿，合并既有草稿须经用户确认）；发布非幂等，超时或结果不明先回查 `published` 版本状态，严禁盲目重放。
 
-#### 写入规则
+---
 
-统一使用无损过渡顺序：
+## 13. 结构修订连带记录数据 (`record_data`)
+<!-- SOURCE: modify-app/record-data-revision-sub-agent.yaml -->
 
-```text
-建立新结构 → 切换新业务 → 迁移历史数据 → 验证新旧结果 → 清理旧结构
-```
-
-- 新结构验证完成前保留旧结构；需要人工判断或缺少安全接口时，拆分自动操作与协同/人工事项；
-- 固定值更新时先按目标值归组，同一工作表、同一批记录和相同字段值使用批量记录接口；不同映射值、不同工作表或不同验证口径分别成批，不逐记录调用写接口；
-- 明确区分已完成的结构与未完成的数据迁移；无法确认全局引用时保留旧资产；
-- 清理旧结构必须作为独立高风险阶段重新展示影响范围并确认。
-
-#### 回读验证
-
-- 核对新结构、关联方向和必要引用，对比迁移前后记录数、匹配数、异常数及关键业务汇总；
-- 验证新业务已切换，旧结构不再新增或双写；
-- 未完成迁移、未知依赖和人工事项必须保留，不得提前清理或标记为全部完成。
-
-### 10.3 案例：单选升级为关联表
-
-**目标**：把 `客户行业` 从单选升级为独立的 `行业分类` 表。
-
-1. 创建 `行业分类` 表和 Relation 字段，并切换表单、视图、规则和图表；
-2. 按已确认方式回填历史关联，对比记录数、匹配数和异常数；
-3. 将旧单选字段设为新建时隐藏；历史迁移和引用核对完成前禁止删除。
-
-### 10.4 清理旧结构的门槛
-
-只有同时满足以下条件才提出物理清理：
-
-- 历史数据已迁移、明确保留或经用户接受不迁移；新业务不再写入旧结构；
-- 视图、规则、公式、页面、图表、流程、权限和外部集成已经核对；
-- 用户确认删除对象和影响范围，且已有可执行补偿或明确恢复依据。
+- **推荐精确工具集**：`get_record_list`、`get_record_details`、`get_record_relations`、`get_record_pivot_data`、`get_record_logs`、`batch_create_records`、`batch_update_records`、`update_record`
+- **参考规格**：`references/hap-domain-record-data-spec.md`、`references/hap-sample-data-spec.md`
+- **读写与保护规则**：
+  - **强制前置探测与冻结**：所有写调用强制 `triggerWorkflow: false`。修改存量记录前必须先用实际筛选调 `get_record_list(includeTotalCount: true, pageSize: 1, pageIndex: 1)` 探测准确行数并核对 `modify/safety-rules.md` 阈值；首次写入前分页拉取并去重冻结全部目标 `rowId`，二次核对 `totalCount` 无漂移后再执行。
+  - **五类场景执行规范**：① **初始记录与示例新增**：加载 `references/hap-sample-data-spec.md`（仅示例场景），按稳定唯一业务键查重，零匹配项调 `batch_create_records`；② **同值初始化/广播**：全部目标行写入完全相同 `fields` 时按冻结 ID 分片（≤1,000 行/批）调 `batch_update_records`，核对 `successfulRowIds / failedRowIds`；③ **逐行差异转换（≤20 行）**：基于确定字典/公式逐条 `update_record` 并立即 `get_record_details` 回读；④ **跨表结转（≤20 行）**：第一批在目标表按唯一业务键查重创建拿真实 `rowIds`，第二批逐条回写源表关联字段；⑤ **旧字段清理**：仅在新字段 100% 对账通过且引用全部切换后执行，禁传 Schema 未声明的 `null` 猜测清空。

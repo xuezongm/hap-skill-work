@@ -1,84 +1,79 @@
-# Step 4: 创建 AI 智能助手 SOP (4_create_chatbots)
+# Step 4: AI 智能助手创建与 Agent 节点配置 SOP (`4_create_chatbots`)
 
-本文档是 Build 阶段 **Step 4（创建应用专属 AI 助手与知识库关联）** 的专属作业指导书。
+<!-- SOURCE: build-app/chatbot-create-sub-agent.yaml -->
+<!-- SOURCE: build-app/chatbot-config-sub-agent.yaml -->
 
----
-
-## 目录
-
-1. [执行定位与输入契约](#一-执行定位与输入契约)
-2. [引用的平台规格 (SSOT)](#二-引用的平台规格-ssot)
-3. [执行 SOP 流水线](#三-执行-sop-流水线)
-4. [输出交付物契约 (.build)](#四-输出交付物契约-build)
-5. [⛔ 验证断言与错误自愈](#五-⛔-验证断言与错误自愈)
+本文件按构建阶段分为两节：**Step 4a（阶段 2 创建助手实体拿 `chatbotId`）** 与 **Step 4b（阶段 3 表/视图就绪后绑定关联工作流 `ai_agent` 节点并发布）**。请严格按 `taskContext.step`（`"4a"` 或 `"4b"`）执行对应章节！
 
 ---
 
-## 一、 执行定位与输入契约
+## 一、 Step 4a：创建 AI 助手实体（`taskContext.step == "4a"`，阶段 2 执行）
 
-- **执行方式**：独立子代理；
-- **任务目标**：根据 `hap-plan.json` 创建应用的专属 AI 智能问答助手，绑定工作表与知识库，配置场景化欢迎语与快捷提问；
-- **核心输入契约**：
-  - `hap-plan.json`：AI 助手规划（`chatbot`）；
-  - `hap-context.json`：`appId`、已建工作表 ID 映射。
+### 1. 输入与白名单
+- **输入切片**（`.build/task-context/step4-chatbot.json`）：`planSlice.aiAssistants`、`planSlice.worksheetsSummary`（表名与简介，用于撰写初始提示词）、`planSlice.appLanguage`；`contextSlice.appId`、`contextSlice.sectionIdByName`。
+- **必读领域规范**：`references/hap-domain-chatbot-spec.md`
+- **准许工具白名单**：`["create_chatbot"]`
 
----
+### 2. 核心规则与执行步骤（源自 `chatbot-create-sub-agent.yaml`）
+1. 若 `aiAssistants` 为空，不调用任何工具，直接输出空 `chatbotIdByName: {}` 成功回执。
+2. 遍历 `aiAssistants`，使用 `appLanguage` 指定语言为每个助手构造参数并调用 `create_chatbot`：
+   - `appId`：应用真实 ID；
+   - `name`：原样保持规划名称；
+   - `icon`：原样保留带 `sys_` 前缀的合法 `fileName`（严禁剥离 `sys_` 前缀）；
+   - `sectionId`：从 `sectionIdByName` 按 `groupName` 反查（查不到则省略）；
+   - `remark`：一句简洁的业务定位说明；
+   - `welcomeMessage`：结合 `description` 生成友好的场景欢迎语；
+   - `presetQuestions`：结合应用表名与业务场景生成 **3～5 个具体业务提问（绝对严禁超过 5 个！）**；
+   - `prompt`：遵循 `references/hap-domain-chatbot-spec.md` 四段式结构生成初始系统提示词（列出应用工作表数据范围与回答准则）。
+   - **参数红线**：严禁传入 `systemPrompt`、`shortcuts`、`worksheets`、`model`、`iconColor` 等不存在的伪参数！同一助手创建成功后严禁重复调用。
 
-## 二、 引用的平台规格 (SSOT)
-
-> [!IMPORTANT]
-> **Primary Reference (平台规格 SSOT)**：
-> 📖 [references/spec-chatbots.md](../../references/spec-chatbots.md)（AI 助手创建、模型选型与知识库挂载）
-
----
-
-## 三、 执行 SOP 流水线
-
-1. **读取 Plan 与工作表映射**：提取助手名称、提示词（`systemPrompt`）及需要检索的工作表 ID 列表；
-2. **调用 MCP 创建助手**：调用 `create_chatbot`：
-```json
-{
-  "appId": "<appId>",
-  "name": "智能问答助手",
-  "systemPrompt": "...",
-  "worksheets": [ ...工作表ID数组... ],
-  "welcomeMessage": "...",
-  "shortcuts": [ ...快捷提问数组... ]
-}
-```
-获取返回的 `chatbotId`。
-
----
-
-## 四、 输出交付物契约 (.build)
-
-执行成功后，将助手 ID 与回执写入独立任务回执文件：
-- **文件路径**：`.build/receipts/step4-chatbot.json`
-- **内容格式**：
+### 3. Step 4a 回执格式（写入 `.build/receipts/step4-chatbot.json`）
 ```json
 {
   "taskId": "step4-chatbot",
-  "executor": { "kind": "subagent", "agentId": "{agentId}" },
-  "step": "4",
-  "target": { "type": "chatbot", "name": "智能问答助手" },
+  "runId": "<runId>",
+  "executor": { "kind": "subagent", "agentId": "<agentId>" },
+  "step": "4a",
+  "target": { "type": "chatbot", "name": "AI智能助手" },
   "status": "succeeded",
   "outputs": {
-    "chatbotId": "bot_id_123",
-    "chatbotName": "智能问答助手",
-    "chatbotIdByName": { "智能问答助手": "bot_id_123" }
+    "chatbotIdByName": { "<助手名称>": "<create_chatbot返回的24位id>" },
+    "chatbotContext": [{ "name": "<助手名称>", "id": "<24位id>" }]
   },
-  "verification": {
-    "passed": true,
-    "evidence": ["调用 create_chatbot 成功创建智能问答助手并捕获 chatbotId: bot_id_123"]
-  },
+  "verification": { "passed": true, "evidence": ["调用 create_chatbot 成功创建助手实体"] },
   "issues": []
 }
 ```
 
 ---
 
-## 五、 ⛔ 验证断言与错误自愈
+## 二、 Step 4b：配置已建助手的关联工作流 `ai_agent` 节点（`taskContext.step == "4b"`，阶段 3 按助手并发执行）
 
-1. **断言 1 (创建成功)**：`create_chatbot` 返回成功且捕获合法 `chatbotId`；
-2. **断言 2 (回执通知)**：将包含 `chatbotIdByName` 的标准回执写入 `.build/receipts/step4-chatbot.json`；
-3. **自愈机制**：若创建报错提示工作表 ID 非法，从 `hap-context.json` 重新获取合法工作表 ID。
+### 1. 输入与白名单
+- **输入切片**（`.build/task-context/step4b-chatbot-config-{name}.json`）：`planSlice.assistant`（含 `name`、`description`、`requirements`）、`planSlice.appLanguage`；`contextSlice.appId`、`contextSlice.chatbotId`、`contextSlice.viewIdByName`；`worksheetContextSlice`（已刷新工作表真实 ID 与别名）。
+- **必读领域规范**：`references/hap-domain-chatbot-spec.md`（第四、五节）
+- **准许工具白名单**：`["get_workflow_structure", "get_workflow_node", "update_workflow_node", "publish_process", "get_app_ai_models", "get_app_knowledge_list", "get_worksheet_structure", "get_view_structure"]`
+
+### 2. 核心规则与执行步骤（源自 `chatbot-config-sub-agent.yaml`）
+1. **定位底层工作流节点**：`chatbotId` 同时就是该助手关联工作流的 `workflowId`（若 `chatbotId` 为空则直接跳过，绝不新建助手）。调用 `get_workflow_structure(workflow_id: chatbotId, version: "draft")` 定位 `ai_agent` 节点的 `nodeId`，再调用 `get_workflow_node` 读取当前节点配置。
+2. **绑定真实数据表与工具范围**：
+   - 结合 `assistant.description`、`requirements` 与 `worksheetContextSlice` / `viewIdByName` 的真实 ID，选择必要的数据查询、统计、记录操作或知识检索配置（仅当明确需要知识库或特定模型时才调 `get_app_knowledge_list` / `get_app_ai_models`，本步骤不绑定 `callWorkflow`，不运行任何业务工具）；
+   - 保留正常的 `input/file` 引用与既有 `toolId`，`tools` 数组完整保留未改项；若 `requirements` 要求只读或限定特定表范围，必须在节点工具配置中实际收窄/停用对应写工具，不能只写在提示词里；保持用户权限检查开启与写操作确认开启。
+3. **一次更新并发布生效**：
+   - 合并本节点所需变更，调用 1 次 `update_workflow_node`（`config` 传原生 JSON Object；若原配置已完全满足目标则免写）；
+   - 默认调用 `publish_process(workflow_id: chatbotId)` 发布生效（仅当 `requirements` 明确指定只存草稿时不发布；结果未知先核查发布版本，严禁盲目重放）。
+
+### 3. Step 4b 回执格式（写入 `.build/receipts/step4b-chatbot-config-{name}.json`）
+```json
+{
+  "taskId": "<来自 taskContext.taskId>",
+  "runId": "<runId>",
+  "executor": { "kind": "subagent", "agentId": "<agentId>" },
+  "step": "4b",
+  "target": { "type": "chatbot", "id": "<chatbotId>", "name": "<助手名称>" },
+  "status": "succeeded",
+  "outputs": { "completed": true, "chatbotId": "<chatbotId>", "notes": [] },
+  "verification": { "passed": true, "evidence": ["已更新关联工作流 ai_agent 节点资源绑定并发布生效"] },
+  "issues": []
+}
+```

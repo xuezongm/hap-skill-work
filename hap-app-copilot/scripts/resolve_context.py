@@ -2,10 +2,15 @@
 # -*- coding: utf-8 -*-
 """
 resolve_context.py
-HAP App Builder 渐进加载上下文动态解析引擎。
+HAP App Copilot 渐进加载上下文动态解析与章节级点读引擎。
 
-根据工作流模式 (mode)、资产类型 (assets)、复杂场景 (scenarios) 或搭建步骤 (step)，
-计算当前任务所需加载的最小参考文件集合，避免无关文档进入上下文。
+支持能力：
+1. --mode {plan,build,modify,audit} --assets/--domains ... [--render]：
+   按当前场景与目标领域计算最小参考清单，或直接渲染裁剪后的 Modify / Audit 上下文包；
+2. --file <rel_path> [--section <关键词> | --list-sections]：
+   对大体积设计指南或领域 Spec 执行二级章节精准点读（对齐线上 load_skill(skillName, section)）；
+3. --validate：
+   自检全库所有模式、构建步骤与领域资产映射文件的物理存在性。
 """
 
 import argparse
@@ -13,30 +18,106 @@ import json
 import os
 import re
 import sys
-from typing import List, Dict, Set
+from typing import Dict, List, Set
 
+# modify/modify_guide.md 章节映射（支持多项映射，如 chart 同时关联页面图表与工作表统计图）
+MODIFY_GUIDE_SECTION_MAPPING: Dict[str, List[str]] = {
+    "app": ["第 2 章"],
+    "navigation": ["第 2 章"],
+    "app_nav": ["第 2 章"],
+    "app_navigation": ["第 2 章"],
+    "worksheet": ["第 3 章"],
+    "field": ["第 3 章"],
+    "relation": ["第 3 章"],
+    "layout": ["第 3 章"],
+    "rule": ["第 3 章"],
+    "business_rule": ["第 3 章"],
+    "index": ["第 3 章"],
+    "worksheet_index": ["第 3 章"],
+    "worksheet_filter": ["第 3 章"],
+    "custom_field": ["第 3 章"],
+    "free_field": ["第 3 章"],
+    "view": ["第 4 章"],
+    "action": ["第 4 章"],
+    "view_action": ["第 4 章"],
+    "role": ["第 5 章"],
+    "permission": ["第 5 章"],
+    "role_permission": ["第 5 章"],
+    "page": ["第 6 章"],
+    "custom_page": ["第 6 章"],
+    "worksheet_chart": ["第 7 章"],
+    "page_chart": ["第 6 章", "第 7 章"],
+    "chart": ["第 6 章", "第 7 章"],
+    "chatbot": ["第 8 章"],
+    "print_template": ["第 9 章"],
+    "template": ["第 9 章"],
+    "public_form": ["第 10 章"],
+    "external_portal": ["第 11 章"],
+    "portal": ["第 11 章"],
+    "workflow": ["第 12 章"],
+    "workflow_design": ["第 12 章"],
+    "record": ["第 13 章"],
+    "data": ["第 13 章"],
+    "record_data": ["第 13 章"],
+    "sample_data": ["第 13 章"],
+}
 
-MODIFY_GUIDE_SECTION_MAPPING: Dict[str, str] = {
-    "app": "第 2 章 应用信息与导航",
-    "navigation": "第 2 章 应用信息与导航",
-    "worksheet": "第 3 章 工作表与字段",
-    "field": "第 3 章 工作表与字段",
-    "relation": "第 3 章 工作表与字段",
-    "layout": "第 3 章 工作表与字段",
-    "view": "第 4 章 视图与自定义动作",
-    "action": "第 4 章 视图与自定义动作",
-    "rule": "第 5 章 业务规则",
-    "business_rule": "第 5 章 业务规则",
-    "print_template": "第 6 章 打印模板",
-    "template": "第 6 章 打印模板",
-    "page": "第 7 章 自定义页面与图表",
-    "chart": "第 7 章 自定义页面与图表",
-    "workflow": "第 8 章 工作流",
-    "workflow_design": "第 8 章 工作流",
-    "role": "第 9 章 角色与权限",
-    "permission": "第 9 章 角色与权限",
-    "record": "第 10 章 数据修改、结构重构与迁移",
-    "data": "第 10 章 数据修改、结构重构与迁移",
+MODIFY_GUIDE_SECTION_ORDER: List[str] = [
+    "第 1 章",
+    "第 2 章",
+    "第 3 章",
+    "第 4 章",
+    "第 5 章",
+    "第 6 章",
+    "第 7 章",
+    "第 8 章",
+    "第 9 章",
+    "第 10 章",
+    "第 11 章",
+    "第 12 章",
+    "第 13 章",
+]
+
+# modify/impact-map.md 二级章节关键词映射
+IMPACT_MAP_SECTION_MAPPING: Dict[str, List[str]] = {
+    "app": ["应用与导航"],
+    "navigation": ["应用与导航"],
+    "app_nav": ["应用与导航"],
+    "app_navigation": ["应用与导航"],
+    "public_form": ["应用与导航"],
+    "external_portal": ["应用与导航"],
+    "portal": ["应用与导航"],
+    "worksheet": ["工作表、字段、业务规则与索引"],
+    "field": ["工作表、字段、业务规则与索引"],
+    "relation": ["工作表、字段、业务规则与索引"],
+    "layout": ["工作表、字段、业务规则与索引"],
+    "rule": ["工作表、字段、业务规则与索引"],
+    "business_rule": ["工作表、字段、业务规则与索引"],
+    "index": ["工作表、字段、业务规则与索引"],
+    "worksheet_index": ["工作表、字段、业务规则与索引"],
+    "worksheet_filter": ["工作表、字段、业务规则与索引"],
+    "custom_field": ["工作表、字段、业务规则与索引"],
+    "free_field": ["工作表、字段、业务规则与索引"],
+    "view": ["视图与自定义动作"],
+    "action": ["视图与自定义动作"],
+    "view_action": ["视图与自定义动作"],
+    "page": ["自定义页面与统计图表"],
+    "custom_page": ["自定义页面与统计图表"],
+    "page_chart": ["自定义页面与统计图表"],
+    "chart": ["自定义页面与统计图表"],
+    "worksheet_chart": ["自定义页面与统计图表"],
+    "chatbot": ["AI 助手、打印模板、角色与工作流/数据"],
+    "print_template": ["AI 助手、打印模板、角色与工作流/数据"],
+    "template": ["AI 助手、打印模板、角色与工作流/数据"],
+    "role": ["AI 助手、打印模板、角色与工作流/数据"],
+    "permission": ["AI 助手、打印模板、角色与工作流/数据"],
+    "role_permission": ["AI 助手、打印模板、角色与工作流/数据"],
+    "workflow": ["AI 助手、打印模板、角色与工作流/数据"],
+    "workflow_design": ["AI 助手、打印模板、角色与工作流/数据"],
+    "record": ["AI 助手、打印模板、角色与工作流/数据"],
+    "data": ["AI 助手、打印模板、角色与工作流/数据"],
+    "record_data": ["AI 助手、打印模板、角色与工作流/数据"],
+    "sample_data": ["AI 助手、打印模板、角色与工作流/数据"],
 }
 
 MODIFY_COMPLEX_SCENARIOS: Set[str] = {
@@ -57,20 +138,6 @@ MODIFY_DATA_SCENARIOS: Set[str] = {
     "dependency_governance",
 }
 
-MODIFY_GUIDE_SECTION_ORDER: List[str] = [
-    "第 1 章 使用方法",
-    "第 2 章 应用信息与导航",
-    "第 3 章 工作表与字段",
-    "第 4 章 视图与自定义动作",
-    "第 5 章 业务规则",
-    "第 6 章 打印模板",
-    "第 7 章 自定义页面与图表",
-    "第 8 章 工作流",
-    "第 9 章 角色与权限",
-    "第 10 章 数据修改、结构重构与迁移",
-]
-
-# Audit 检查项前缀到维度的映射
 AUDIT_CHECK_PREFIXES: Dict[str, str] = {
     "STR": "structure",
     "BIZ": "business",
@@ -79,7 +146,6 @@ AUDIT_CHECK_PREFIXES: Dict[str, str] = {
     "SEC": "security",
 }
 
-# Audit 维度到 audit-checks.md 中章节标题的映射
 AUDIT_DIMENSION_SECTIONS: Dict[str, str] = {
     "structure": "三、结构健康度",
     "business": "四、业务完整度",
@@ -88,16 +154,22 @@ AUDIT_DIMENSION_SECTIONS: Dict[str, str] = {
     "security": "七、安全与维护",
 }
 
-# collection-guide.md 中资产类型到章节标题的映射
 COLLECTION_ASSET_SECTIONS: Dict[str, str] = {
     "app": "应用与导航",
     "navigation": "应用与导航",
+    "app_nav": "应用与导航",
+    "app_navigation": "应用与导航",
+    "external_portal": "公开表单与外部门户",
+    "portal": "公开表单与外部门户",
     "worksheet": "工作表与字段",
     "field": "工作表与字段",
     "relation": "工作表与字段",
     "layout": "工作表与字段",
-    "view": "视图",
+    "worksheet_filter": "视图与常用筛选",
+    "public_form": "公开表单与外部门户",
+    "view": "视图与常用筛选",
     "action": "自定义动作",
+    "view_action": "视图与常用筛选",
     "rule": "业务规则",
     "business_rule": "业务规则",
     "print_template": "打印模板",
@@ -105,15 +177,20 @@ COLLECTION_ASSET_SECTIONS: Dict[str, str] = {
     "workflow": "工作流",
     "role": "角色与权限",
     "permission": "角色与权限",
+    "role_permission": "角色与权限",
     "page": "自定义页面与图表",
+    "custom_page": "自定义页面与图表",
+    "page_chart": "自定义页面与图表",
     "chart": "自定义页面与图表",
+    "worksheet_chart": "自定义页面与图表",
+    "chatbot": "AI 对话机器人",
     "record": "业务数据",
     "data": "业务数据",
+    "record_data": "业务数据",
 }
 
 
 def get_skill_root() -> str:
-    """获取 Skill 根目录绝对路径"""
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
@@ -123,125 +200,153 @@ def resolve_files(
     scenarios: List[str] = None,
     step: str = None,
 ) -> List[str]:
-    """解析出需要加载的文件相对路径列表"""
     files: Set[str] = set()
     scenarios = scenarios or []
 
-    # 1. 基础工作流文件
     if mode == "plan":
-        files.add("workflows/plan.md")
-        files.add("plan/1a_plan_overview.md")
-        files.add("plan/1b_plan_schema.md")
-        files.add("references/guide-design.md")
-        files.add("references/guide-workflows.md")
-        files.add("references/spec-app-styles.md")
+        files.update([
+            "workflows/plan.md",
+            "plan/1a_plan_overview.md",
+            "plan/1b_plan_schema.md",
+            "references/hap-app-design-guide.md",
+            "references/hap-workflow-design-guide.md",
+            "references/hap-domain-app-spec.md",
+            "references/hap-icon-palette.md",
+        ])
     elif mode == "build":
-        files.add("workflows/build.md")
-        files.add("build/CONTEXT.md")
-        files.add("build/PROGRESS.md")
-        files.add("build/OUTPUT_CONTRACT.md")
+        files.update([
+            "workflows/build.md",
+            "build/CONTEXT.md",
+            "build/PROGRESS.md",
+            "build/OUTPUT_CONTRACT.md",
+            "scripts/build_runtime.py",
+            "scripts/merge_worksheet_context.py",
+        ])
     elif mode == "modify":
-        # 普通修改只加载主流程与目标对象 Guide；高风险规则由场景触发。
-        files.add("workflows/modify.md")
-        files.add("modify/modify_guide.md")
+        files.update([
+            "workflows/modify.md",
+            "modify/impact-map.md",
+            "modify/safety-rules.md",
+            "modify/execution-boundaries.md",
+            "modify/modify_guide.md",
+        ])
     elif mode == "audit":
-        files.add("workflows/audit.md")
-        files.add("audit/audit-checks.md")
-        files.add("audit/collection-guide.md")
+        files.update([
+            "workflows/audit.md",
+            "audit/audit-checks.md",
+            "audit/collection-guide.md",
+            "scripts/audit_calc.py",
+        ])
 
-    # 2. 根据 Build Step 加载专属步骤 SOP 与对应的 references 规格
     step_mapping: Dict[str, List[str]] = {
-        "1": ["build/steps/1_create_app.md", "references/spec-app-styles.md"],
-        "1b": ["build/steps/1b_update_app_desc.md"],
-        "2a": ["build/steps/2a_create_worksheets.md", "references/spec-worksheets.md"],
-        "2b": ["build/steps/2b_create_relations.md", "references/spec-worksheets.md"],
+        "1": ["build/steps/1_create_app.md", "references/hap-domain-app-spec.md", "references/hap-icon-palette.md"],
+        "1b": ["build/steps/1b_update_app_desc.md", "references/hap-domain-app-spec.md"],
+        "2a": ["build/steps/2a_create_worksheets.md", "references/hap-domain-worksheet-spec.md", "references/hap-domain-custom-field-spec.md"],
+        "2b": ["build/steps/2b_create_relations.md", "references/hap-domain-worksheet-spec.md"],
         "3": [
             "build/steps/3_create_actions_views_rules.md",
-            "references/spec-actions-views.md",
-            "references/spec-business-rules.md"
+            "references/hap-domain-view-spec.md",
+            "references/hap-domain-custom-action-spec.md",
+            "references/hap-domain-business-rule-spec.md",
         ],
-        "4": ["build/steps/4_create_chatbots.md", "references/spec-chatbots.md"],
-        "5": [
-            "build/steps/5_create_sample_data.md",
-            "references/spec-sample-data.md",
-            "references/resource-sample-images.md"
+        "4": ["build/steps/4_create_chatbots.md", "references/hap-domain-chatbot-spec.md"],
+        "4a": ["build/steps/4_create_chatbots.md", "references/hap-domain-chatbot-spec.md"],
+        "4b": ["build/steps/4_create_chatbots.md", "references/hap-domain-chatbot-spec.md"],
+        "5": ["build/steps/5_create_sample_data.md", "references/hap-sample-data-spec.md"],
+        "6": [
+            "build/steps/6_create_pages.md",
+            "references/hap-domain-custom-page-spec.md",
+            "references/hap-chart-design-guide.md",
+            "references/hap-icon-palette.md",
         ],
-        "6": ["build/steps/6_create_pages.md", "references/spec-pages-charts.md"],
-        "7": ["build/steps/7_sort_app_items.md", "references/guide-design.md"],
-        "8": ["build/steps/8_create_roles.md", "references/spec-roles-permissions.md"],
-        "9": ["build/steps/9_design_workflows.md", "references/guide-workflows.md"],
-        "10": ["build/steps/10_create_workflows.md", "references/spec-workflows.md"],
-        "11": ["build/steps/11_create_action_workflows.md", "references/spec-workflows.md"],
+        "7": ["build/steps/7_sort_app_items.md", "references/hap-domain-app-spec.md"],
+        "8": ["build/steps/8_create_roles.md", "references/hap-domain-role-spec.md", "references/hap-app-design-guide.md"],
+        "10": [
+            "build/steps/10_create_workflows.md",
+            "references/hap-workflow-design-guide.md",
+            "references/hap-domain-workflow-spec.md",
+        ],
+        "11": [
+            "build/steps/11_create_action_workflows.md",
+            "references/hap-workflow-design-guide.md",
+            "references/hap-domain-workflow-spec.md",
+        ],
     }
 
     if step and step in step_mapping:
-        for f in step_mapping[step]:
-            files.add(f)
+        files.update(step_mapping[step])
 
-    # 3. 根据目标资产 (assets) 加载对应的 references 规格文件 (主要用于 Modify / Audit)
     asset_mapping: Dict[str, List[str]] = {
-        "app": [],
-        "navigation": ["references/guide-design.md"],
-        "worksheet": ["references/spec-worksheets.md"],
-        "field": ["references/spec-worksheets.md"],
-        "relation": ["references/spec-worksheets.md"],
-        "layout": ["references/spec-worksheets.md"],
-        "sample_data": ["references/spec-sample-data.md"],
-        "rule": ["references/spec-business-rules.md"],
-        "business_rule": ["references/spec-business-rules.md"],
-        "print_template": ["references/spec-print-templates.md"],
-        "template": ["references/spec-print-templates.md"],
-        "view": ["references/spec-actions-views.md"],
-        "action": ["references/spec-actions-views.md"],
-        "chatbot": ["references/spec-chatbots.md"],
-        "page": ["references/spec-pages-charts.md"],
-        "chart": ["references/spec-pages-charts.md"],
-        "role": ["references/spec-roles-permissions.md"],
-        "permission": ["references/spec-roles-permissions.md"],
-        "record": [],
-        "data": [],
-        "workflow": ["references/spec-workflows.md"],
-        "workflow_design": ["references/guide-workflows.md"],
-        "custom_field": ["references/spec-custom-fields.md"],
-        "free_field": ["references/spec-custom-fields.md"],
-        "index": ["references/spec-worksheet-indexes.md"],
-        "worksheet_index": ["references/spec-worksheet-indexes.md"],
-        "icon": ["references/spec-app-styles.md"],
-        "style": ["references/spec-app-styles.md"],
-        "design": ["references/guide-design.md"],
+        "app": ["references/hap-domain-app-spec.md", "references/hap-icon-palette.md"],
+        "navigation": ["references/hap-domain-app-spec.md", "references/hap-icon-palette.md"],
+        "app_nav": ["references/hap-domain-app-spec.md", "references/hap-icon-palette.md"],
+        "app_navigation": ["references/hap-domain-app-spec.md", "references/hap-icon-palette.md"],
+        "worksheet": ["references/hap-domain-worksheet-spec.md"],
+        "field": ["references/hap-domain-worksheet-spec.md"],
+        "relation": ["references/hap-domain-worksheet-spec.md"],
+        "layout": ["references/hap-domain-worksheet-spec.md"],
+        "worksheet_filter": ["references/hap-domain-worksheet-spec.md"],
+        "custom_field": ["references/hap-domain-custom-field-spec.md"],
+        "free_field": ["references/hap-domain-custom-field-spec.md"],
+        "index": ["references/hap-domain-worksheet-index-spec.md"],
+        "worksheet_index": ["references/hap-domain-worksheet-index-spec.md"],
+        "rule": ["references/hap-domain-business-rule-spec.md"],
+        "business_rule": ["references/hap-domain-business-rule-spec.md"],
+        "view": ["references/hap-domain-view-spec.md"],
+        "action": ["references/hap-domain-custom-action-spec.md"],
+        "view_action": ["references/hap-domain-view-spec.md", "references/hap-domain-custom-action-spec.md"],
+        "role": ["references/hap-domain-role-spec.md"],
+        "permission": ["references/hap-domain-role-spec.md"],
+        "role_permission": ["references/hap-domain-role-spec.md"],
+        "page": ["references/hap-domain-custom-page-spec.md", "references/hap-chart-design-guide.md"],
+        "custom_page": ["references/hap-domain-custom-page-spec.md", "references/hap-chart-design-guide.md"],
+        "worksheet_chart": ["references/hap-domain-worksheet-chart-spec.md", "references/hap-chart-design-guide.md"],
+        "page_chart": [
+            "references/hap-domain-custom-page-spec.md",
+            "references/hap-domain-worksheet-chart-spec.md",
+            "references/hap-chart-design-guide.md",
+        ],
+        "chart": [
+            "references/hap-domain-custom-page-spec.md",
+            "references/hap-domain-worksheet-chart-spec.md",
+            "references/hap-chart-design-guide.md",
+        ],
+        "chatbot": ["references/hap-domain-chatbot-spec.md"],
+        "print_template": ["modify/steps/print_template.md"],
+        "template": ["modify/steps/print_template.md"],
+        "public_form": ["references/hap-domain-worksheet-spec.md"],
+        "external_portal": ["references/hap-domain-external-portal-spec.md"],
+        "portal": ["references/hap-domain-external-portal-spec.md"],
+        "workflow": ["references/hap-domain-workflow-spec.md", "references/hap-workflow-design-guide.md"],
+        "workflow_design": ["references/hap-workflow-design-guide.md"],
+        "record": ["references/hap-domain-record-data-spec.md"],
+        "data": ["references/hap-domain-record-data-spec.md"],
+        "record_data": ["references/hap-domain-record-data-spec.md", "references/hap-sample-data-spec.md"],
+        "sample_data": ["references/hap-sample-data-spec.md"],
+        "icon": ["references/hap-icon-palette.md"],
+        "style": ["references/hap-domain-app-spec.md", "references/hap-icon-palette.md"],
+        "design": ["references/hap-app-design-guide.md"],
     }
 
     for a in assets:
         key = a.strip().lower()
         if key in asset_mapping:
-            for f in asset_mapping[key]:
-                files.add(f)
+            files.update(asset_mapping[key])
 
-    # 复杂执行边界只属于 Modify，由操作场景触发，不与目标资产混用。
-    normalized_scenarios = {s.strip().lower() for s in scenarios}
-    if mode == "modify" and normalized_scenarios.intersection(MODIFY_COMPLEX_SCENARIOS):
-        files.add("modify/safety-rules.md")
-        files.add("modify/execution-boundaries.md")
+    if mode == "modify" and {s.strip().lower() for s in scenarios}.intersection(MODIFY_DATA_SCENARIOS):
+        files.add("references/hap-domain-record-data-spec.md")
 
-    # 保持确定的顺序
     return sorted(list(files))
 
 
 def validate_all_mappings() -> bool:
-    """自检所有模式、步骤、资产与复杂场景映射的文件物理存在性"""
     skill_root = get_skill_root()
     all_files: Set[str] = set()
-    for m in ["plan", "build", "audit"]:
+    for m in ["plan", "build", "modify", "audit"]:
         all_files.update(resolve_files(m, []))
-    all_files.update(resolve_files("modify", []))
-    for s in ["1", "1b", "2a", "2b", "3", "4", "5", "6", "7", "8", "9", "10", "11"]:
+    for s in ["1", "1b", "2a", "2b", "3", "4a", "4b", "5", "6", "7", "8", "10", "11"]:
         all_files.update(resolve_files("build", [], step=s))
-    all_assets = [
-        "app", "navigation", "worksheet", "field", "relation", "layout", "sample_data",
-        "rule", "business_rule", "print_template", "template", "view", "action", "chatbot",
-        "page", "chart", "role", "permission", "record", "data", "workflow",
-        "workflow_design", "custom_field", "free_field", "index", "worksheet_index", "icon", "style", "design"
-    ]
+    all_assets = list(MODIFY_GUIDE_SECTION_MAPPING.keys()) + ["icon", "style", "design"]
     for a in all_assets:
         all_files.update(resolve_files("modify", [a]))
     for scenario in sorted(MODIFY_COMPLEX_SCENARIOS):
@@ -263,41 +368,43 @@ def validate_all_mappings() -> bool:
 
 
 def reference_sections(rel_path: str, assets: List[str], scenarios: List[str]) -> List[str]:
-    """返回本次任务实际需要阅读的章节或检索方式。"""
-    if rel_path != "modify/modify_guide.md":
-        if rel_path.startswith("references/"):
-            return ["按当前操作和参数检索"]
-        return ["全文"]
-
-    sections = {"第 1 章 使用方法"}
-    for asset in assets:
-        section = MODIFY_GUIDE_SECTION_MAPPING.get(asset.strip().lower())
-        if section:
-            sections.add(section)
-    if {s.strip().lower() for s in scenarios}.intersection(MODIFY_DATA_SCENARIOS):
-        sections.add("第 10 章 数据修改、结构重构与迁移")
-    return [section for section in MODIFY_GUIDE_SECTION_ORDER if section in sections]
+    if rel_path == "modify/modify_guide.md":
+        sections = {"第 1 章"}
+        for asset in assets:
+            for sec in MODIFY_GUIDE_SECTION_MAPPING.get(asset.strip().lower(), []):
+                sections.add(sec)
+        if {s.strip().lower() for s in scenarios}.intersection(MODIFY_DATA_SCENARIOS):
+            sections.add("第 13 章")
+        return [s for s in MODIFY_GUIDE_SECTION_ORDER if s in sections]
+    if rel_path.startswith("modify/steps/"):
+        return ["仅文件制作或替换时读取；纯配置和删除跳过"]
+    if rel_path.startswith("references/"):
+        return ["使用 --file <path> --section <关键词> 按需点读"]
+    return ["已裁剪渲染"]
 
 
 def reference_purpose(rel_path: str) -> str:
-    """说明参考文件对当前任务的职责。"""
     if rel_path == "workflows/modify.md":
-        return "Modify 执行流程与阶段门禁"
+        return "Modify 内联执行流程与沟通红线"
+    if rel_path == "modify/impact-map.md":
+        return "跨领域连带分类与固定依赖顺序"
     if rel_path == "modify/modify_guide.md":
-        return "对象关联影响、修改与验证规则"
+        return "12 领域增量读写规则与精确工具集"
     if rel_path == "modify/safety-rules.md":
-        return "复杂或高风险修改的安全底线"
+        return "二元风险、14 类删除直通与数据阈值底线"
     if rel_path == "modify/execution-boundaries.md":
-        return "Modify 复杂操作执行、停止与人工协同边界"
+        return "平台能力边界与跨应用数据源引用规则"
     if rel_path == "audit/audit-checks.md":
         return "Audit 检查项、证据要求与评分规则"
     if rel_path == "audit/collection-guide.md":
         return "Audit 证据范围、接口选择与停止条件"
-    if rel_path.startswith("references/spec-"):
-        return "目标资产底层参数规范"
-    if rel_path.startswith("references/guide-"):
-        return "目标资产业务设计指导"
-    return "任务所需参考资料"
+    if rel_path.startswith("modify/steps/"):
+        return "本地文件制作步骤、HAP 专用语法与交付检查"
+    if rel_path.endswith("-guide.md"):
+        return "业务建模与设计指南"
+    if rel_path.startswith("references/hap-domain-"):
+        return "领域对象底层参数与合法结构规范"
+    return "任务所需参考规范"
 
 
 def build_reference_records(
@@ -306,7 +413,6 @@ def build_reference_records(
     scenarios: List[str],
     absolute: bool = False,
 ) -> List[Dict[str, object]]:
-    """生成轻量参考清单，不计算内容哈希。"""
     skill_root = get_skill_root()
     records = []
     for rel_path in resolved_rel_paths:
@@ -320,21 +426,15 @@ def build_reference_records(
 
 
 def extract_guide_sections(content: str, requested_sections: List[str]) -> str:
-    """从 Guide 中提取指定的二级编号章节。"""
+    """从 modify_guide.md 提取指定的编号二级章节。"""
     lines = content.splitlines(keepends=True)
     heading_indexes = []
     for index, line in enumerate(lines):
-        match = re.match(r"^##\s+(目录|([0-9]+)\.)", line)
+        match = re.match(r"^##\s+([0-9]+)\.", line)
         if match:
-            key = "目录" if match.group(1) == "目录" else f"第 {match.group(2)} 章"
-            heading_indexes.append((index, key))
+            heading_indexes.append((index, f"第 {match.group(1)} 章"))
 
-    requested_keys = set()
-    for section in requested_sections:
-        chapter_match = re.match(r"第\s+([0-9]+)\s+章", section)
-        if chapter_match:
-            requested_keys.add(f"第 {chapter_match.group(1)} 章")
-
+    requested_keys = set(requested_sections)
     selected = []
     for position, (start, key) in enumerate(heading_indexes):
         if key not in requested_keys:
@@ -344,36 +444,77 @@ def extract_guide_sections(content: str, requested_sections: List[str]) -> str:
     return "".join(selected).rstrip()
 
 
-def extract_audit_checks(content: str, check_ids: List[str]) -> str:
-    """从 audit-checks.md 提取指定 CHK-* 行所在维度的表头和匹配行。
-
-    返回包含通用章节（执行与证据契约、评分算法）和匹配维度表格的精简内容。
-    """
+def extract_impact_map_sections(content: str, assets: List[str], scenarios: List[str]) -> str:
+    """从 impact-map.md 提取公共原则、命中领域的连带表格及固定顺序速查。"""
     lines = content.splitlines(keepends=True)
+    h2_spans = []
+    for idx, line in enumerate(lines):
+        if re.match(r"^##\s+", line):
+            h2_spans.append((idx, line.strip()))
 
-    # 解析需要的维度
+    needed_keywords = {"统一分类与交互原则", "跨领域固定依赖顺序速查"}
+    for a in assets:
+        for kw in IMPACT_MAP_SECTION_MAPPING.get(a.strip().lower(), []):
+            needed_keywords.add(kw)
+    if {s.strip().lower() for s in scenarios}.intersection(MODIFY_DATA_SCENARIOS):
+        needed_keywords.add("AI 助手、打印模板、角色与工作流/数据")
+
+    selected = []
+    for pos, (start, title) in enumerate(h2_spans):
+        end = h2_spans[pos + 1][0] if pos + 1 < len(h2_spans) else len(lines)
+        if any(kw in title for kw in needed_keywords):
+            selected.extend(lines[start:end])
+    return "".join(selected).rstrip()
+
+
+def extract_markdown_section_by_keyword(content: str, section_query: str = "", list_only: bool = False) -> str:
+    """通用二级章节目录展示与按标题关键词点读（对齐线上 load_skill(skillName, section)）。"""
+    lines = content.splitlines(keepends=True)
+    h2_spans = []
+    for idx, line in enumerate(lines):
+        if re.match(r"^##\s+", line):
+            h2_spans.append((idx, line.strip()))
+
+    if list_only or not section_query:
+        toc = [title for _, title in h2_spans]
+        return "可用二级章节列表：\n" + "\n".join(f"- {t}" for t in toc) + "\n"
+
+    queries = [q.strip().lower() for q in section_query.split(",") if q.strip()]
+    header = lines[: h2_spans[0][0]] if h2_spans else lines
+    matched = []
+    for pos, (start, title) in enumerate(h2_spans):
+        end = h2_spans[pos + 1][0] if pos + 1 < len(h2_spans) else len(lines)
+        title_lower = title.lower()
+        if any(q in title_lower for q in queries):
+            matched.extend(lines[start:end])
+
+    if not matched:
+        toc = "\n".join(f"- {t}" for _, t in h2_spans)
+        return f"⚠️ 未找到匹配 '{section_query}' 的二级章节。当前文件可用章节如下：\n{toc}\n"
+
+    return "".join(header + matched).rstrip() + "\n"
+
+
+def extract_audit_checks(content: str, check_ids: List[str]) -> str:
+    lines = content.splitlines(keepends=True)
     needed_dimensions: Set[str] = set()
     for cid in check_ids:
         match = re.match(r"CHK-([A-Z]+)-\d+", cid)
         if match and match.group(1) in AUDIT_CHECK_PREFIXES:
             needed_dimensions.add(AUDIT_CHECK_PREFIXES[match.group(1)])
 
-    # 定位各二级章节
     section_spans = []
     for index, line in enumerate(lines):
         if re.match(r"^## ", line):
             section_spans.append((index, line.strip()))
 
-    # 始终包含一、二章（契约和算法）；按需包含维度章节
     selected = []
     check_id_set = set(check_ids)
     for position, (start, title) in enumerate(section_spans):
         end = section_spans[position + 1][0] if position + 1 < len(section_spans) else len(lines)
-        # 一、二章始终包含
         if "执行与证据契约" in title or "评分与评级算法" in title:
             selected.extend(lines[start:end])
             continue
-        # 检查维度章节是否匹配
         matched_dimension = False
         for dim, section_keyword in AUDIT_DIMENSION_SECTIONS.items():
             if section_keyword in title and dim in needed_dimensions:
@@ -381,42 +522,30 @@ def extract_audit_checks(content: str, check_ids: List[str]) -> str:
                 break
         if not matched_dimension:
             continue
-        # 提取表头和匹配行
         section_lines = lines[start:end]
         header_added = False
         for sline in section_lines:
-            # 章节标题始终保留
             if sline.startswith("## ") or sline.startswith("| 检查项") or sline.startswith("|---"):
                 selected.append(sline)
                 header_added = True
             elif sline.startswith("| `CHK-"):
-                # 检查行是否匹配请求的 check_ids
                 row_match = re.match(r"^\| `(CHK-[A-Z]+-\d+)`", sline)
                 if row_match and row_match.group(1) in check_id_set:
                     selected.append(sline)
             elif not header_added:
-                # 章节标题之前的空行
                 selected.append(sline)
 
     return "".join(selected).rstrip()
 
 
 def extract_collection_sections(content: str, asset_types: List[str]) -> str:
-    """从 collection-guide.md 提取指定资产类型对应的子章节。
-
-    始终包含一～三章（核心原则、三类证据、按模式采集）和五～七章（预算、观察、并行）。
-    四章按资产类型选择性提取子章节。
-    """
     lines = content.splitlines(keepends=True)
-
-    # 需要的子章节标题
     needed_subsections: Set[str] = set()
     for at in asset_types:
         key = at.strip().lower()
         if key in COLLECTION_ASSET_SECTIONS:
             needed_subsections.add(COLLECTION_ASSET_SECTIONS[key])
 
-    # 定位二级章节
     h2_spans = []
     for index, line in enumerate(lines):
         if re.match(r"^## ", line):
@@ -425,35 +554,26 @@ def extract_collection_sections(content: str, asset_types: List[str]) -> str:
     selected = []
     for position, (start, title) in enumerate(h2_spans):
         end = h2_spans[position + 1][0] if position + 1 < len(h2_spans) else len(lines)
-
-        # 四章需要选择性提取
         if "各类对象的读取规则" in title:
             section_lines = lines[start:end]
-            # 定位三级子章节
             h3_spans_local = []
             for local_idx, sline in enumerate(section_lines):
                 if re.match(r"^### ", sline):
                     h3_spans_local.append((local_idx, sline.strip()))
-
-            # 始终保留章节标题
             selected.append(section_lines[0])
             if len(section_lines) > 1 and not section_lines[1].startswith("###"):
                 selected.append(section_lines[1])
-
             for sub_pos, (sub_start, sub_title) in enumerate(h3_spans_local):
                 sub_end = h3_spans_local[sub_pos + 1][0] if sub_pos + 1 < len(h3_spans_local) else len(section_lines)
-                # 检查子章节标题是否匹配需要的资产类型
                 for needed in needed_subsections:
                     if needed in sub_title:
                         selected.extend(section_lines[sub_start:sub_end])
                         break
         else:
-            # 其他章节全部保留
             selected.extend(lines[start:end])
 
-    # 文件标题（#开头的行在第一个 ## 之前）
     if h2_spans:
-        header = lines[:h2_spans[0][0]]
+        header = lines[: h2_spans[0][0]]
         return "".join(header + selected).rstrip()
     return "".join(selected).rstrip()
 
@@ -464,37 +584,43 @@ def render_modify_policy_bundle(
     scenarios: List[str],
     absolute: bool = False,
 ) -> str:
-    """输出 Modify 所需的最小 Guide 正文和按需参考清单。"""
     skill_root = get_skill_root()
-    references = build_reference_records(resolved_rel_paths, assets, scenarios, absolute=absolute)
+    spec_paths = [p for p in resolved_rel_paths if p.startswith("references/")]
+    references = build_reference_records(spec_paths, assets, scenarios, absolute=absolute)
+    step_paths = [p for p in resolved_rel_paths if p.startswith("modify/steps/")]
     metadata = {
         "mode": "modify",
         "assets": assets,
         "scenarios": scenarios,
-        "references": references,
-        "note": "Guide 章节已渲染；references/spec-* 只需检索当前操作和参数，不要求阅读全文。",
+        "specReferences": references,
+        "stepReferences": build_reference_records(step_paths, assets, scenarios, absolute=absolute),
+        "note": "安全底线、能力边界、对应领域的连带影响表与操作卡已直接渲染；底层 references/hap-*.md 仅在构造复杂参数时用 --file <path> --section <关键词> 按需点读。",
     }
     parts = [
-        "# Modify 最小上下文",
+        "# Modify 最小上下文规则包",
         "",
-        "## 按需参考清单",
+        "## 按需底层规格清单",
         "",
         "```json",
         json.dumps(metadata, ensure_ascii=False, indent=2),
         "```",
     ]
 
-    policy_order = [
-        "modify/modify_guide.md",
-        "modify/safety-rules.md",
-        "modify/execution-boundaries.md",
+    render_plan = [
+        ("modify/safety-rules.md", "full"),
+        ("modify/execution-boundaries.md", "full"),
+        ("modify/impact-map.md", "impact"),
+        ("modify/modify_guide.md", "guide"),
     ]
-    for rel_path in policy_order:
-        if rel_path not in resolved_rel_paths:
+    for rel_path, mode_tag in render_plan:
+        abs_fp = os.path.join(skill_root, rel_path)
+        if not os.path.exists(abs_fp):
             continue
-        with open(os.path.join(skill_root, rel_path), "r", encoding="utf-8") as file_obj:
+        with open(abs_fp, "r", encoding="utf-8") as file_obj:
             content = file_obj.read()
-        if rel_path == "modify/modify_guide.md":
+        if mode_tag == "impact":
+            content = extract_impact_map_sections(content, assets, scenarios)
+        elif mode_tag == "guide":
             content = extract_guide_sections(content, reference_sections(rel_path, assets, scenarios))
         parts.extend([
             "",
@@ -509,68 +635,35 @@ def render_audit_context(
     resolved_rel_paths: List[str],
     audit_checks: List[str],
     audit_assets: List[str],
-    absolute: bool = False,
 ) -> str:
-    """输出 Audit 所需的最小检查项和采集章节。"""
     skill_root = get_skill_root()
-    parts = [
-        "# Audit 最小上下文",
-        "",
-    ]
+    parts = ["# Audit 最小上下文", ""]
 
-    # audit-checks.md 按需提取
     checks_path = os.path.join(skill_root, "audit", "audit-checks.md")
     if os.path.exists(checks_path):
         with open(checks_path, "r", encoding="utf-8") as f:
             checks_content = f.read()
         if audit_checks:
             extracted = extract_audit_checks(checks_content, audit_checks)
-            parts.extend([
-                "## 已加载：audit/audit-checks.md（按需提取）",
-                "",
-                extracted.rstrip(),
-                "",
-            ])
+            parts.extend(["## 已加载：audit/audit-checks.md（按需提取）", "", extracted.rstrip(), ""])
         else:
-            parts.extend([
-                "## 已加载：audit/audit-checks.md（全文）",
-                "",
-                checks_content.rstrip(),
-                "",
-            ])
+            parts.extend(["## 已加载：audit/audit-checks.md（全文）", "", checks_content.rstrip(), ""])
 
-    # collection-guide.md 按需提取
     guide_path = os.path.join(skill_root, "audit", "collection-guide.md")
     if os.path.exists(guide_path):
         with open(guide_path, "r", encoding="utf-8") as f:
             guide_content = f.read()
         if audit_assets:
             extracted = extract_collection_sections(guide_content, audit_assets)
-            parts.extend([
-                "## 已加载：audit/collection-guide.md（按需提取）",
-                "",
-                extracted.rstrip(),
-                "",
-            ])
+            parts.extend(["## 已加载：audit/collection-guide.md（按需提取）", "", extracted.rstrip(), ""])
         else:
-            parts.extend([
-                "## 已加载：audit/collection-guide.md（全文）",
-                "",
-                guide_content.rstrip(),
-                "",
-            ])
+            parts.extend(["## 已加载：audit/collection-guide.md（全文）", "", guide_content.rstrip(), ""])
 
-    # audit.md 始终全文
     audit_path = os.path.join(skill_root, "workflows", "audit.md")
     if "workflows/audit.md" in resolved_rel_paths and os.path.exists(audit_path):
         with open(audit_path, "r", encoding="utf-8") as f:
             audit_content = f.read()
-        parts.extend([
-            "## 已加载：workflows/audit.md（全文）",
-            "",
-            audit_content.rstrip(),
-            "",
-        ])
+        parts.extend(["## 已加载：workflows/audit.md（全文）", "", audit_content.rstrip(), ""])
 
     metadata = {
         "mode": "audit",
@@ -585,24 +678,41 @@ def render_audit_context(
         json.dumps(metadata, ensure_ascii=False, indent=2),
         "```",
     ])
-
     return "\n".join(parts).rstrip() + "\n"
 
 
 def main():
-    parser = argparse.ArgumentParser(description="HAP App Builder 上下文动态解析器")
+    parser = argparse.ArgumentParser(description="HAP App Copilot 上下文渐进加载与章节级点读引擎")
     parser.add_argument("--mode", choices=["plan", "build", "modify", "audit"], default="modify", help="工作流模式")
-    parser.add_argument("--assets", type=str, default="", help="资产类型列表，逗号分隔 (如 field,relation,view)")
-    parser.add_argument("--scenarios", type=str, default="", help="复杂场景列表，逗号分隔 (如 physical_delete,cross_table_migration)")
-    parser.add_argument("--step", type=str, default="", help="Build 步骤编号 (如 2a, 3, 10)")
-    parser.add_argument("--json", action="store_true", help="是否输出为 JSON 格式")
-    parser.add_argument("--render", action="store_true", help="输出 Modify 前置规则正文包与参考清单")
-    parser.add_argument("--absolute", action="store_true", help="是否输出绝对文件路径")
-    parser.add_argument("--validate", action="store_true", help="校验所有映射文件的物理存在性")
-    parser.add_argument("--audit-checks", type=str, default="", help="Audit 检查项 ID 列表，逗号分隔 (如 CHK-BIZ-006,CHK-BIZ-007)")
-    parser.add_argument("--audit-assets", type=str, default="", help="Audit 采集资产类型列表，逗号分隔 (如 worksheet,workflow)")
+    parser.add_argument("--assets", type=str, default="", help="目标资产/领域列表，逗号分隔 (如 worksheet,public_form,role_permission)")
+    parser.add_argument("--domains", type=str, default="", help="--assets 的同义别名，逗号分隔")
+    parser.add_argument("--scenarios", type=str, default="", help="可选复杂场景列表，逗号分隔")
+    parser.add_argument("--step", type=str, default="", help="Build 步骤编号 (如 2a, 3, 4b, 9a, 10)")
+    parser.add_argument("--file", type=str, default="", help="指定单个参考文件相对路径进行二级章节检索 (如 references/hap-app-design-guide.md)")
+    parser.add_argument("--section", type=str, default="", help="配合 --file 按关键词点读二级章节正文 (逗号分隔可多选)")
+    parser.add_argument("--list-sections", action="store_true", help="配合 --file 仅列出该文件的二级章节目录")
+    parser.add_argument("--json", action="store_true", help="以 JSON 格式输出文件清单")
+    parser.add_argument("--render", action="store_true", help="渲染输出裁剪后的 Modify 最小规则包")
+    parser.add_argument("--absolute", action="store_true", help="输出绝对文件路径")
+    parser.add_argument("--validate", action="store_true", help="自检所有映射文件的物理存在性")
+    parser.add_argument("--audit-checks", type=str, default="", help="Audit 检查项 ID 列表，逗号分隔")
+    parser.add_argument("--audit-assets", type=str, default="", help="Audit 采集资产类型列表，逗号分隔")
 
     args = parser.parse_args()
+
+    if args.validate:
+        sys.exit(0 if validate_all_mappings() else 1)
+
+    skill_root = get_skill_root()
+    if args.file:
+        target_fp = args.file if os.path.isabs(args.file) else os.path.join(skill_root, args.file)
+        if not os.path.isfile(target_fp):
+            print(f"❌ 参考文件不存在：{args.file}", file=sys.stderr)
+            sys.exit(1)
+        with open(target_fp, "r", encoding="utf-8") as f:
+            content = f.read()
+        print(extract_markdown_section_by_keyword(content, section_query=args.section, list_only=args.list_sections), end="")
+        sys.exit(0)
 
     if args.render and args.json:
         parser.error("--render 与 --json 不能同时使用")
@@ -611,11 +721,8 @@ def main():
     if (args.audit_checks or args.audit_assets) and args.mode != "audit":
         parser.error("--audit-checks 和 --audit-assets 仅支持 --mode audit")
 
-    if args.validate:
-        success = validate_all_mappings()
-        sys.exit(0 if success else 1)
-
-    assets = [a.strip() for a in args.assets.split(",") if a.strip()]
+    raw_assets = ",".join(x for x in (args.assets, args.domains) if x)
+    assets = [a.strip() for a in raw_assets.split(",") if a.strip()]
     scenarios = [s.strip() for s in args.scenarios.split(",") if s.strip()]
     audit_checks = [c.strip() for c in args.audit_checks.split(",") if c.strip()]
     audit_assets = [a.strip() for a in args.audit_assets.split(",") if a.strip()]
@@ -626,41 +733,16 @@ def main():
             "未知 Modify 复杂场景：" + ", ".join(unknown_scenarios)
             + "；可选值：" + ", ".join(sorted(MODIFY_COMPLEX_SCENARIOS))
         )
-    resolved_rel_paths = resolve_files(
-        args.mode,
-        assets,
-        scenarios=scenarios,
-        step=args.step,
-    )
 
-    skill_root = get_skill_root()
-    if args.absolute:
-        final_paths = [os.path.join(skill_root, p) for p in resolved_rel_paths]
-    else:
-        final_paths = resolved_rel_paths
+    resolved_rel_paths = resolve_files(args.mode, assets, scenarios=scenarios, step=args.step)
+    final_paths = [os.path.join(skill_root, p) for p in resolved_rel_paths] if args.absolute else resolved_rel_paths
 
     if args.render:
-        print(render_modify_policy_bundle(
-            resolved_rel_paths,
-            assets,
-            scenarios,
-            absolute=args.absolute,
-        ), end="")
+        print(render_modify_policy_bundle(resolved_rel_paths, assets, scenarios, absolute=args.absolute), end="")
     elif args.mode == "audit" and (audit_checks or audit_assets):
-        # Audit 按需渲染模式
-        print(render_audit_context(
-            resolved_rel_paths,
-            audit_checks,
-            audit_assets,
-            absolute=args.absolute,
-        ), end="")
+        print(render_audit_context(resolved_rel_paths, audit_checks, audit_assets), end="")
     elif args.json:
-        references = build_reference_records(
-            resolved_rel_paths,
-            assets,
-            scenarios,
-            absolute=args.absolute,
-        )
+        references = build_reference_records(resolved_rel_paths, assets, scenarios, absolute=args.absolute)
         output_data = {
             "mode": args.mode,
             "guideIncluded": "modify/modify_guide.md" in resolved_rel_paths if args.mode == "modify" else None,

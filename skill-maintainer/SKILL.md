@@ -52,6 +52,14 @@ description: 审查、创建或调整 Agent/Codex Skill 的文件分工、内容
 python3 {SKILL_DIR}/scripts/audit_skill.py {TARGET_SKILL_DIR}
 ```
 
+当维护目标为 `hap-app-copilot` 且需与本地 AgentService 源码同步共享规格或检查同源锚点时，先读取 [同步说明](references/hap-copilot-sync.md) 核对范围与校验边界，再运行：
+
+```bash
+python3 {SKILL_DIR}/scripts/sync_hap_copilot.py --check
+```
+
+同步工具、说明与执行入口仅保留在维护侧；公开发布的 `hap-app-copilot` 可保留来源信息，不包含同步功能说明或指向维护侧同步资料的入口。
+
 脚本结果只作为线索。语义重复、职责冲突和内容粒度必须人工判断。
 
 ### 3. 建立权威归属表

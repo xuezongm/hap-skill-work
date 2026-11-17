@@ -1,92 +1,71 @@
-# Step 10: 部署系统自动化工作流 SOP (10_create_workflows)
+# Step 10: 单条系统工作流设计、创建、校验与发布 SOP (`10_create_workflows`)
 
-本文档是 Build 阶段 **Step 10（按工作流并发创建并发布系统工作流）** 的专属作业指导书。
+<!-- SOURCE: build-app/workflow-design-sub-agent.yaml -->
+<!-- SOURCE: build-app/workflow-build-sub-agent.yaml -->
 
----
+## 一、 本地宿主输入与参考映射
 
-## 目录
-
-1. [执行定位与输入契约](#一-执行定位与输入契约)
-2. [引用的平台规格 (SSOT)](#二-引用的平台规格-ssot)
-3. [单工作流执行 SOP 流水线](#三-单工作流执行-sop-流水线)
-4. [输出交付物契约 (.build)](#四-输出交付物契约-build)
-5. [⛔ 验证断言与错误自愈](#五-⛔-验证断言与错误自愈)
-
----
-
-## 一、 执行定位与输入契约
-
-- **执行方式**：子代理按系统工作流并发；
-- **任务目标**：根据 `hap-plan.json` 中 Step 9 设计好的系统工作流方案，创建工作流实体、批量注入节点连线、校验并正式发布启用；
-- **核心输入契约**：
-  - `hap-plan.json`：当前系统工作流的设计方案（`workflows.system`）；
-  - `worksheetContext.json`：相关工作表的真实字段结构与 controlId 映射；
-  - `hap-context.json`：`appId`。
+- **执行方式**：独立 Subagent 按**单条系统工作流**并发执行，在同一子代理上下文内一气呵成完成 **「7 维闭环节点设计 ➔ 真实 ID 与身份映射 ➔ 物理建流与节点注入 ➔ 校验修复与发布」**，消除双阶段 JSON 传话失真与重复读表开销。
+- **输入切片**：读取 `.build/task-context/{taskId}.json`：
+  - `planSlice`：`workflow`（来自 `hap-plan.json` 的单条系统流定义，含 `name`、`description`、`trigger`、`intentHints`、`requirements`）、`workflowIndex`（全应用系统流职责索引）、`customActionIndex`（全应用动作流职责索引）、`relationLayouts`、`appLanguage`；
+  - `contextSlice`：`appId`、`org_id`（用作人员/部门查询的 `orgId`）、`worksheetIdByName`、`roleContext`（`[{ name, id, roleScope }]`）、`viewIdByName`；
+  - `worksheetContextSlice`：已建工作表真实 `worksheetId` 及字段 `{ name, id, alias, type, options }`（含选项 `{ key, value, index }`）。
+- **必读领域规范**：`references/hap-workflow-design-guide.md`、`references/hap-domain-workflow-spec.md`
+- **准许工具白名单**：`["find_member", "find_department", "get_current_user", "get_worksheet_field", "get_worksheet_structure", "create_process", "get_workflow_structure", "get_workflow_node", "get_workflow_variables", "update_workflow_node", "update_workflow_variables", "batch_create_process_nodes", "batch_delete_process_nodes", "validate_process", "publish_process", "get_sms_signatures"]`
 
 ---
 
-## 二、 引用的平台规格 (SSOT)
+## 二、 核心构建规则与执行步骤
 
-> [!IMPORTANT]
-> **Primary Reference (平台规格 SSOT)**：
-> 📖 [references/spec-workflows.md](../../references/spec-workflows.md)（系统工作流创建、触发器、节点 Schema 与发布时序）
+### 1. 基于真实表结构的节点拓扑设计（源自 `workflow-design-sub-agent.yaml`）
+1. **只用真实上下文**：严格基于 `worksheetContextSlice` 中真实存在的表名、24 位字段 `id` 与选项 `key` 设计条件、查询、计算和更新，严禁捏造不存在的字段或选项；对照 `workflowIndex` 与 `customActionIndex` 明确本流程边界，避免与按钮动作流重复写数或互相循环触发。
+2. **完整因果闭环**：将 `workflow` 的 `description`、`intentHints` 与 `requirements` 全部落实为“触发（更新时间触发必设具体监听字段防死循环）→ 必要关联/单条取数 → 业务计算/审批/分支 → 状态与关联写回/通知”的完整节点链，不得停留在仅取数的半截步骤。
+3. **审批块（`approval_block`）双分支闭环硬门禁**：
+   - 凡包含 `approval_block` 的审批流程，**严禁只建一个孤立的 `approval_block` 就结束或发布**！
+   - 审批前确保单据状态处于“待审批/审核中”（若触发条件本身未限定或前置未置状态，先用 `update_record` 写入对应选项 `key`）；
+   - **`approval_block` 之后必须紧接 `branch` 分支节点完整处理两种审批结果**（注意分支路径首节点的 `prevNode` 指向所属 `branch`、`parentNode` 指向对应路径，且条件/更新的数据源引用上游触发或记录节点而非 `branch` 自身）：
+     - **通过路径**：调用 `update_record` 将状态更新为“已通过/已生效”（真实选项 `key`）+ 完成必要的下游关联写回/台账生成 + `send_notification` 通知发起人；
+     - **驳回路径**：调用 `update_record` 将状态回退为“已驳回/待修改”（真实选项 `key`）+ `send_notification` 通知发起人驳回信息以便修改重提。
+4. **人员与通知语义保真**：应用角色使用 `roleContext` 真实 `roleId`（`PersonRef { kind: "role", id }`）；固定姓名/部门调 `find_member`/`find_department`（`orgId` 传 `contextSlice.org_id`，不得传 `appId`，脱敏手机/邮箱不可外发）；“通知我”调 `get_current_user`（勿与运行时 `triggerUser` 混淆）；短信通知调 `get_sms_signatures` 取有效签名。关键接收者无法唯一定位时保留草稿（`status: "draft"`）说明缺口，严禁私自换人或删减必要节点强行发布。
+
+### 2. 物理创建、Schema 前置核验与发布流水线（源自 `workflow-build-sub-agent.yaml`）
+1. **懒加载 MCP 工具 Schema 前置必读（禁盲猜试错）**：
+   - 在构造 `create_process` 与 `batch_create_process_nodes` 参数前，若当前宿主为懒加载 MCP 环境（如 `<appDataDir>/mcp/{mcpServer}/batch_create_process_nodes.json`），**必须先用 `read_file` 读取对应工具的 Schema 定义**，核准 `approval_block`、`branch`、`update_record`、`Condition.op` 的精确入参格式，**严禁不读 Schema 盲猜参数靠接口报错反复试错**。
+2. **字段与选项铁律**：
+   - 节点中引用业务 `fieldId` **必须使用 24 位真实 `id`，严禁传 `alias`**；
+   - 给单选/多选/下拉字段赋值时，**必须且只能传选项的真实 `key`**，严禁传中文名 `value`！关联取数节点的目标表由来源关联字段自动推导，不传 `worksheetId`；严禁直接更新公式/汇总/他表只读衍生字段。
+3. **创建流程外壳**：若 `worksheet_event` / `date_field` 的触发工作表查不到真实表 ID，直接返回 `status: "skipped"` 不调工具；否则调用 `create_process(appId, name, description, publish: false, trigger)`，读取返回的 `processId` 与 **`triggerAlias`**（仅缺失 `triggerAlias` 时调 1 次 `get_workflow_structure` 兜底取 `trigger.nodeAlias`）。
+4. **批量注入节点与内部块由内向外发布**：
+   - 调用 `batch_create_process_nodes(workflow_id: processId, nodes)` 一次性或分组写入节点（触发记录引用使用 `triggerAlias`）；
+   - 若含 `approval_block / sub_process / loop`，单独对其内部 `processId` 完成校验与 `publish_process`，**先内后外**。
+5. **校验定点修复与主流程发布**：
+   - 调用 `validate_process(workflow_id: processId)`；若有 `issues`，按 `nodeId / path / hint` 用 `update_workflow_node`（`config` 传原生 Object）定点修复，严禁静默删减审批或通知节点凑发布；
+   - 校验通过后调用 `publish_process(workflow_id: processId)` 发布上线（超时或结果未知先调 `get_workflow_structure` 查 `published` 版本，严禁盲目重放）。
 
 ---
 
-## 三、 单工作流执行 SOP 流水线
+## 三、 本地回执落盘契约
 
-### 1. 创建工作流实体与获取触发节点
-调用 `create_process` 创建空白系统工作流（`description` 必填）：
+执行完成后，写入 `receiptPath`（`.build/receipts/step10-sys-wf-{name}.json`）：
+
 ```json
 {
-  "appId": "<appId>",
-  "name": "新订单自动扣减库存并通知",
-  "description": "当订单状态变更为已支付时，自动扣减关联商品库存并推送发货提醒",
-  "type": 1
-}
-```
-- 直接从 `create_process` 返回值提取 `triggerAlias` / `nodeId` 作为后续所有节点引用触发记录的标识。
-
-### 2. 批量注入业务节点 (batch_create_process_nodes)
-按照 `references/spec-workflows.md` 规范，调用 `batch_create_process_nodes` 注入节点：
-- 子流程（`sub_process`）和审批块（`approval_block`）按规范走两阶段创建（先建空壳获取内部 `processId`，再向内部注入节点）；
-- 给选项字段赋值必须使用选项真实 `key`。
-
-### 3. 校验并发布启用 (validate & publish)
-- ⚠️ **含子流程/审批块时必须先发布内部 processId，最后发布主流程**（防 `NodeAppIsNull` 致命错误）；
-- 调用 `publish_process` 将工作流置为正式发布状态。
-
----
-
-## 四、 输出交付物契约 (.build)
-
-执行成功后，将发布结果与标准回执写入独立任务回执文件：
-- **文件路径**：`.build/receipts/step10-sys-wf-{workflowName}.json`
-- **内容格式**：
-```json
-{
-  "taskId": "step10-sys-wf-{workflowName}",
-  "executor": { "kind": "subagent", "agentId": "{agentId}" },
+  "taskId": "<来自 taskContext.taskId>",
+  "runId": "<runId>",
+  "executor": { "kind": "subagent", "agentId": "<agentId>" },
   "step": "10",
-  "target": { "type": "workflow", "name": "{workflowName}" },
+  "target": { "type": "workflow", "id": "<processId>", "name": "<workflowName>" },
   "status": "succeeded",
   "outputs": {
-    "workflowName": "{workflowName}",
-    "processId": "proc_sys_123",
-    "published": true
+    "workflowName": "<workflowName>",
+    "processId": "<processId>",
+    "status": "published",
+    "description": "<已发布简述用途；若为 draft/skipped/unknown 说明具体原因>"
   },
   "verification": {
     "passed": true,
-    "evidence": ["调用 publish_process 成功校验并发布工作流 proc_sys_123"]
+    "evidence": ["已完成系统工作流节点设计、创建、validate_process 校验与 publish_process 发布"]
   },
   "issues": []
 }
 ```
-
----
-
-## 五、 ⛔ 验证断言与错误自愈
-
-1. **断言 1 (发布成功)**：`publish_process` 返回成功（或已成功发布）；
-2. **断言 2 (回执通知)**：将包含 `workflowName`、`processId` 与 `published: true` 的标准回执写入 `.build/receipts/step10-sys-wf-{workflowName}.json`；
-3. **自愈机制**：若 `validate_process` 报错提示连线异常，根据返回的错误节点 ID 自动修正 nextNodeId 并重试。

@@ -1,160 +1,74 @@
-# Step 3: 视图、动作与业务规则一体化 SOP (3_create_actions_views_rules)
+# Step 3: 单表结构刷新、自定义动作、视图与业务规则一体化 SOP (`3_create_actions_views_rules`)
 
-本文档是 Build 阶段 **Step 3（单表一体化：结构采集 + 自定义动作 + 视图配置 + 业务规则）** 的专属作业指导书。
+<!-- SOURCE: build-app/view-build-sub-agent.yaml -->
+<!-- SOURCE: build-app/business-rule-build-sub-agent.yaml -->
 
----
+## 一、 本地宿主输入与参考映射
 
-## 目录
-
-1. [执行定位与输入契约](#一-执行定位与输入契约)
-2. [引用的平台规格 (SSOT)](#二-引用的平台规格-ssot)
-3. [单表执行 SOP 流水线（严格四步闭环）](#三-单表执行-sop-流水线严格四步闭环)
-4. [输出交付物契约 (.build)](#四-输出交付物契约-build)
-5. [⛔ 验证断言与防死循环铁律](#五-⛔-验证断言与防死循环铁律)
-
----
-
-## 一、 执行定位与输入契约
-
-- **执行方式**：按工作表并发派发原子 Subagent（任务 ID: `step3-view-act-{targetWorksheet}`）；
-- **任务目标**：针对指定的单张工作表闭环完成：
-  1. **结构采集**：调用 1 次 `get_worksheet_structure` 获取本表最新字段（包含 Step 2b 二次回填自动生成的反向关联字段与真实物理 `controlId`），并写入结构分片；
-  2. **业务规则**：配置本表的业务规则（显隐、只读、必填、错误拦截）；
-  3. **自定义动作**：创建本表的自定义动作并捕获 `actionId`；
-  4. **个性化视图**：创建本表的个性化视图（表格、看板、画廊等），使用真实字段配置过滤、排序与显示列；
-  5. **双产物落盘**：写入结构分片文件与标准任务回执。
-- **核心输入契约**：
-  - 读取最小任务上下文：`.build/task-context/step3-view-act-{targetWorksheet}.json`（包含 `appId`、`worksheetId`、`worksheetName`、`businessRules`、`views`、`customActions`）。
+- **执行方式**：独立 Subagent 按表并发执行（本地单表合并执行：仅调 1 次 `get_worksheet_structure` 同时服务于动作、视图、业务规则与全局字段分片落盘）。
+- **输入切片**：读取 `.build/task-context/{taskId}.json`：
+  - `planSlice`：`worksheetName`、`views`（紧凑字符串数组）、`customActions`（本表动作数组）、`businessRules`（对应 `businessRulesNotes`）、`requirements`、`appLanguage`；
+  - `contextSlice`：`appId`、`worksheetId`（24 位 hex）、`worksheetIdByName`、`artifactPath`（`.build/artifacts/worksheet-{worksheetId}.json`）。
+- **必读领域规范**：`references/hap-domain-view-spec.md`、`references/hap-domain-custom-action-spec.md`、`references/hap-domain-business-rule-spec.md`
+- **准许工具白名单**：`["get_worksheet_structure", "create_custom_actions", "create_view", "get_view_structure", "update_view", "create_business_rule"]`
 
 ---
 
-## 二、 引用的平台规格 (SSOT)
+## 二、 核心构建规则与执行步骤
 
-> [!IMPORTANT]
-> **Primary References (平台规格 SSOT)**：
-> 1. 📖 [references/spec-actions-views.md](../../references/spec-actions-views.md)（视图类型规范与自定义动作参数配置指南）
-> 2. 📖 [references/spec-business-rules.md](../../references/spec-business-rules.md)（业务规则条件语法与动作配置规范）
->
-> **准许调用工具清单 (Tool Whitelist)**：
-> `["get_worksheet_structure", "create_business_rule", "create_custom_actions", "create_view"]`
+- **输出语言锁定**：视图名、动作文案、规则名称与校验提示消息必须严格使用 `appLanguage` 指定语言。
 
----
+### Step 0：拉取关联落定后的最新完整字段并落盘分片（全链路唯一一次结构回读）
+1. 若 `worksheetId` 为空，直接输出空回执结束，不调任何工具。
+2. 调用 1 次 `get_worksheet_structure(appId, worksheet_id: worksheetId, responseFormat: "md", ai_description: "Worksheet: <worksheetName>")`（此时所有表与双向关联均已落定，包含对端 `:bi` 自动生成的反向关联字段）。
+3. **24 位 Hex 字段 ID 清洗铁律**：提取每个字段的 `{ name, id, alias, type, options? }` 时，**必须剥离 ID 后的任何附加标注**（如将 `6a22a6c0912a77961c8e09ab(isTitle)` 清洗为纯净 24 位 hex 字符串 `6a22a6c0912a77961c8e09ab`）。
+4. 将清洗后的单表结构对象 `{ "worksheetId": "<worksheetId>", "worksheetName": "<worksheetName>", "alias": "<本表alias>", "fields": [...] }` 写入 `contextSlice.artifactPath`（`.build/artifacts/worksheet-{worksheetId}.json`），供 `merge_worksheet_context.py` 强校验归并。
 
-## 三、 单表执行 SOP 流水线（严格四步闭环）
+### Part A：自定义动作与视图创建（源自 `view-build-sub-agent.yaml`）
+1. **先建自定义动作（若有）**：
+   - 若 `customActions` 非空，按 `references/hap-domain-custom-action-spec.md` 及各动作的 `requirements`、`runWorkflowAfterSubmit`、`recordScope` 组装参数，调用 1 次 `create_custom_actions(appId, worksheet_id: worksheetId, actions)`；
+   - 记录返回的动作真实 `id` 与原样回传的关联 `workflowId`（映射为 `processId`，无流程时为空串），供下一步视图挂载 `detailActions / quickActions / batchActions` 及阶段 4 动作工作流使用。
+2. **再建工作表视图（单表严禁无视图）**：
+   - 若 `views` 非空：将大驼峰类型转为 API 小驼峰（`Table→table`、`Kanban→kanban`、`Calendar→calendar` 等；若某高级视图缺少必填支撑字段则降级为 `table`），严格基于 Step 0 清洗后的真实字段 ID 与动作 ID，按 `references/hap-domain-view-spec.md` 将本表所有视图**合并为一次 `create_view(appId, worksheet_id: worksheetId, views)` 批量提交**；
+   - 若 `views` 为空（常见于明细子表）：**必须创建 1 个兜底表格视图** `[{ "name": "全部记录", "type": "table" }]`（英文环境用 `"All"`），确保后续示例数据与查询 API 正常可用；
+   - **防重与修正**：`create_view` 成功后严禁再次调用创建；若个别属性需微调，按真实 `view_id` 调用 `update_view` 原地修正（注意禁止调用 `delete_view` 删除唯一视图）。
 
-每个 Subagent 接收单一目标工作表，按顺序执行以下步骤：
-
-### 1. 采集本表最新结构与分片落盘（严格调用 1 次）
-1. **调用工具**：调用 `get_worksheet_structure` 拉取本表最新字段元数据：
-   ```json
-   {
-     "appId": "<appId>",
-     "worksheet_id": "<worksheetId>"
-   }
-   ```
-2. **提取最新字段列表**：
-   - 提取本表所有字段的 `name`、`controlId` (或 `id`)、`alias`、`type`、`options`，**包含 Step 2b 跨表关联回填在本表自动生成的反向关联字段与 TabTable 明细**；
-3. **写入分片文件**：将拉取到的最新结构写入 `.build/artifacts/worksheet-{worksheetId}.json`（供后续阶段汇聚合并）。
-> ⚠️ **铁律**：`get_worksheet_structure` **本表严格只允许调用 1 次**！一旦收到数据立即进入下一步，严禁任何形式的重复调用或跨表查询！
+### Part B：表单业务规则创建（源自 `business-rule-build-sub-agent.yaml`）
+1. 合并 `businessRules`（`businessRulesNotes`）与 `requirements` 中属于表单业务规则的条目；若无规则要求则直接跳过本部分。
+2. 对每条自然语言规则描述：
+   - **理解业务意图扩展全字段范围**：`businessRulesNotes` 通常采用“意图 + 举例”描述（如“草稿态隐藏审核时间、打款流水号等后续字段”），必须对照 Step 0 拿到的**本表完整真实字段列表**覆盖全部同类后续字段，而非只处理举例中的一两个字段；
+   - 遵循 `references/hap-domain-business-rule-spec.md` 推导 `ruleType`（交互/校验/锁定/样式），构造合法无冲突的 `conditions` 与动作配置块，逐条调用 `create_business_rule`（单条失败最多修正重试 2 次，不中断其余规则）。
 
 ---
 
-### 2. 配置业务规则 (Business Rules)
-若切片上下文中包含 `businessRules` 规划，利用第一步获取的真实字段，调用 `create_business_rule`：
-- **交互规则 (`ruleType: "interaction"`)**：显隐、部分只读、必填、赋值，或**全表只读 (`actionType: "readonlyAllFields"`，免传 `fields`，用户仍可删除记录)**；`conditions` 必须用 `group` 结构；
-- **校验规则 (`ruleType: "validation"`)**：提交前防呆校验拦截，配置 `validateOnServerSave: true` 与 `errorAction: "blockSubmit"`；
-- **锁定规则 (`ruleType: "lock"`)**：单据终态归档封存（**同时锁死编辑与删除记录**，前台显示锁头提示），`conditions` 必须直接传单个 `condition` 对象（仅限单选/多选/勾选字段），附带 `lock: { "message": "..." }`；
+## 三、 本地回执落盘契约
+
+确认 `.build/artifacts/worksheet-{worksheetId}.json` 已写入后，将视图、动作（含 `processId`）及规则计数写入 `receiptPath`（`.build/receipts/step3-view-act-{name}.json`）：
+
 ```json
 {
-  "appId": "<appId>",
-  "worksheet_id": "<worksheetId>",
-  "name": "已归档单据锁定",
-  "ruleType": "lock",
-  "conditions": { "type": "condition", "fieldId": "<statusControlId>", "operator": "eq", "value": "已归档" },
-  "lock": { "message": "单据已归档，系统已自动锁定，禁止修改与删除" }
-}
-```
-
----
-
-### 3. 创建自定义动作 (Custom Actions)
-若切片上下文中包含自定义动作规划，调用 `create_custom_actions`：
-```json
-{
-  "appId": "<appId>",
-  "worksheetId": "<worksheetId>",
-  "customActions": [ ...动作列表... ]
-}
-```
-获取返回的 `actionIdByName`（动作名 → actionId 映射）并记录，供下一步视图关联使用。
-
----
-
-### 4. 创建个性化视图 (Views)
-> [!TIP]
-> **视图一次性创建原则**：
-> 由于建表时已配置 `createDefaultView: false`，工作表初始无多余默认视图。
-> 直接遍历切片中的 `views` 列表，按预设顺序依次调用 `create_view` 一次性创建即可。
-> 严禁调用 `delete_view`、`update_view` 或 `sort_views`。
-
-1. **若 `views` 数组非空**：根据视图类型（表格、看板、画廊等）与第一步获取的字段信息，调用 `create_view`；
-2. **若 `views` 数组为空（如子表）**：调用 `create_view` 创建一个默认表格视图（`[{ "name": "全部记录", "viewType": 0 }]`），确保底层基础视图可用；
-3. 记录每个视图的 `viewIdByName`。
-
----
-
-### 5. 写入标准任务回执
-将执行结果写入回执文件：
-- **文件路径**：`.build/receipts/step3-view-act-{targetWorksheet}.json`
-
----
-
-## 四、 输出交付物契约 (.build)
-
-### 1. 结构分片文件
-- **路径**：`.build/artifacts/worksheet-{worksheetId}.json`
-- **内容**：`get_worksheet_structure` 返回的完整工作表结构对象。
-
-### 2. 标准任务回执
-- **路径**：`.build/receipts/step3-view-act-{targetWorksheet}.json`
-- **格式**：
-```json
-{
-  "taskId": "step3-view-act-{targetWorksheet}",
-  "executor": { "kind": "subagent", "agentId": "{agentId}" },
+  "taskId": "<来自 taskContext.taskId>",
+  "runId": "<来自 taskContext.runId>",
+  "executor": { "kind": "subagent", "agentId": "<当前子代理标识>" },
   "step": "3",
-  "target": { "type": "worksheet", "id": "{worksheetId}", "name": "{targetWorksheet}" },
+  "target": { "type": "worksheet", "id": "<worksheetId>", "name": "<worksheetName>" },
   "status": "succeeded",
   "outputs": {
-    "worksheetId": "{worksheetId}",
-    "worksheetName": "{targetWorksheet}",
-    "businessRulesConfigured": true,
-    "viewIdByName": {
-      "{targetWorksheet}/全部记录": "view_123",
-      "{targetWorksheet}/待处理": "view_456"
-    },
-    "actionIdByName": {
-      "审核通过": "act_789"
-    }
+    "worksheetId": "<worksheetId>",
+    "worksheetName": "<worksheetName>",
+    "viewIdByName": { "<worksheetName>/<视图名>": "<24位真实viewId>" },
+    "views": [{ "name": "<视图名>", "id": "<viewId>", "type": "table" }],
+    "actionIdByName": { "<worksheetName>/<动作名>": "<动作id>" },
+    "actions": [{ "name": "<动作名>", "id": "<动作id>", "processId": "<关联workflowId或空串>" }],
+    "rulesCreated": 2
   },
   "verification": {
     "passed": true,
     "evidence": [
-      "成功调用 get_worksheet_structure 并保存 worksheet 结构分片",
-      "成功调用 create_business_rule 创建业务规则",
-      "成功调用 create_custom_actions 创建自定义动作",
-      "成功调用 create_view 创建个性化视图并捕获 viewId"
+      "已拉取最新字段并写入 artifacts 分片文件",
+      "已完成自定义动作、视图与表单业务规则创建"
     ]
   },
   "issues": []
 }
 ```
-
----
-
-## 五、 ⛔ 验证断言与防死循环铁律
-
-1. **断言 1 (单次回读铁律)**：`get_worksheet_structure` 仅在第 1 步调用 **恰好 1 次**，严禁重复调用；
-2. **断言 2 (视图与动作创建成功)**：创建的视图与动作必须记录对应的 `viewIdByName` 与 `actionIdByName`；
-3. **断言 3 (双产物落地)**：必须同时产出 `.build/artifacts/worksheet-{worksheetId}.json` 分片与 `.build/receipts/step3-view-act-{targetWorksheet}.json` 回执；
-4. **终结规则**：写入回执后，任务即告圆满结束，**绝对禁止再次发起任何工具调用**！

@@ -40,25 +40,31 @@ TYPE_ID_TO_NAME = {
     19: "Region",
     20: "Formula",
     21: "Relation",
+    22: "Divider",
     24: "Location",
     25: "Formula",
     26: "Collaborator",
     27: "Department",
     28: "Rating",
     29: "Relation",
-    30: "SubTable",
+    30: "Lookup",
     31: "Formula",
     32: "Concatenate",
     33: "AutoNumber",
     34: "SubTable",
+    35: "Cascader",
     36: "Checkbox",
-    37: "Lookup",
-    38: "Rollup",
+    37: "Rollup",
+    38: "DateFormula",
     41: "RichText",
     42: "Signature",
+    45: "Embed",
     46: "Time",
-    48: "Role",
-    50: "Cascader",
+    47: "Barcode",
+    48: "OrgRole",
+    50: "QueryRecord",
+    53: "FormulaFunc",
+    54: "CustomField",
 }
 
 SYSTEM_FIELD_IDS = {"rowid", "ownerid", "caid", "ctime", "utime", "uaid"}
@@ -111,16 +117,26 @@ def normalize_worksheet_shard(raw_data, expected_id, expected_name):
             "required": bool(f.get("required") or f.get("notNull")),
         }
 
-        # 提取选项
+        # 提取选项（必须完整保留 key 与 index，供工作流选项赋值与示例数据使用）
         options = f.get("options")
         if options and isinstance(options, list):
             norm_options = []
-            for opt in options:
+            for idx, opt in enumerate(options):
                 if isinstance(opt, dict):
                     val = opt.get("value") or opt.get("name") or opt.get("key") or ""
-                    norm_options.append({"value": val, "isDelete": bool(opt.get("isDelete", False))})
+                    opt_item = {
+                        "value": val,
+                        "isDelete": bool(opt.get("isDelete", False)),
+                    }
+                    if opt.get("key"):
+                        opt_item["key"] = opt["key"]
+                    if "index" in opt:
+                        opt_item["index"] = opt["index"]
+                    else:
+                        opt_item["index"] = idx + 1
+                    norm_options.append(opt_item)
                 elif isinstance(opt, str):
-                    norm_options.append({"value": opt, "isDelete": False})
+                    norm_options.append({"value": opt, "index": idx + 1, "isDelete": False})
             norm_field["options"] = norm_options
 
         # 提取关联元数据
@@ -146,11 +162,15 @@ def normalize_worksheet_shard(raw_data, expected_id, expected_name):
 
         normalized_fields.append(norm_field)
 
-    return {
+    ws_alias = raw_data.get("alias") or ""
+    res_shard = {
         "worksheetId": ws_id,
         "worksheetName": ws_name,
         "fields": normalized_fields,
     }
+    if ws_alias:
+        res_shard["alias"] = ws_alias
+    return res_shard
 
 
 def validate_schema(worksheets, id_to_name, name_to_id, plan_data):
