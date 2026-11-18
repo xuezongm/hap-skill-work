@@ -13,7 +13,9 @@ from unittest.mock import patch
 from zipfile import ZipFile
 
 MAINTAINER = Path(__file__).resolve().parents[1]
-COPILOT = MAINTAINER.parent / "hap-app-copilot"
+COPILOT = MAINTAINER.parent / "hap-mcp-app-builder"
+if not COPILOT.exists() and (MAINTAINER.parent / "hap-app-copilot").exists():
+    COPILOT = MAINTAINER.parent / "hap-app-copilot"
 
 
 def load(name, path):
@@ -186,12 +188,12 @@ class PackageTests(unittest.TestCase):
         self.assertGreater(report["fileCount"], 50)
         self.assertIn("build/.DS_Store", report["excluded"])
         with ZipFile(self.output) as archive:
-            self.assertIn("hap-app-copilot/LICENSE", archive.namelist())
-            self.assertIn("hap-app-copilot/MCP_SETUP.md", archive.namelist())
-            self.assertTrue(all(name.startswith("hap-app-copilot/") for name in archive.namelist()))
+            self.assertIn("hap-mcp-app-builder/LICENSE", archive.namelist())
+            self.assertIn("hap-mcp-app-builder/MCP_SETUP.md", archive.namelist())
+            self.assertTrue(all(name.startswith("hap-mcp-app-builder/") for name in archive.namelist()))
             self.assertFalse(any(packager.excluded(Path(name)) for name in archive.namelist()))
             for name in archive.namelist():
-                self.assertEqual((self.root / Path(name).relative_to("hap-app-copilot")).read_bytes(), archive.read(name))
+                self.assertEqual((self.root / Path(name).relative_to("hap-mcp-app-builder")).read_bytes(), archive.read(name))
 
     def test_check_mode_does_not_create_archive(self):
         report = packager.package(self.root)
@@ -242,11 +244,11 @@ class PackageTests(unittest.TestCase):
         from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 
         updater = load("skill_update", COPILOT / "scripts/skill_update.py")
-        # 1. 构造 v1.0.1 远端发布包与 manifest.json
+        # 1. 构造 v2.0.1 远端发布包与 manifest.json
         v2_src = self.parent / "v2_src"
         shutil.copytree(self.root, v2_src)
-        (v2_src / "release.json").write_text(json.dumps({
-            "name": "hap-app-copilot", "version": "1.0.1", "schemaVersion": 1, "minToolsCount": 170
+        (v2_src / "version.json").write_text(json.dumps({
+            "name": "hap-app-copilot", "version": "2.0.1", "schemaVersion": 1, "minToolsCount": 170
         }), encoding="utf-8")
 
         serve_dir = self.parent / "server"
@@ -269,7 +271,7 @@ class PackageTests(unittest.TestCase):
         self.addCleanup(httpd.server_close)
         self.addCleanup(httpd.shutdown)
 
-        # 3. 准备初始 v1.0.0 受管理目录并执行 check -> update -> rollback
+        # 3. 准备初始 v2.0.0 受管理目录并执行 check -> update -> rollback
         install_entry = self.parent / "skills_host" / "hap-app-copilot"
         shutil.copytree(self.root, install_entry)
         updater.cmd_auto_update(str(install_entry), enable=True, server=server_url, allow_http=True)
@@ -277,11 +279,11 @@ class PackageTests(unittest.TestCase):
         chk = updater.cmd_check(str(install_entry), server=server_url, force=True, allow_http=True)
         self.assertTrue(chk["checked"])
         self.assertTrue(chk["updateAvailable"])
-        self.assertEqual("1.0.1", chk["remoteVersion"])
+        self.assertEqual("2.0.1", chk["remoteVersion"])
 
         upd = updater.cmd_update(str(install_entry), server=server_url, allow_http=True)
         self.assertTrue(upd["updated"])
-        self.assertEqual("1.0.1", upd["version"])
+        self.assertEqual("2.0.1", upd["version"])
         self.assertTrue(install_entry.is_symlink())
 
         # 4. 本地修改文件后应触发 Dirty Check 保护
@@ -291,11 +293,34 @@ class PackageTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "本地定制修改"):
             updater.cmd_update(str(install_entry), server=server_url, allow_http=True)
 
-        # 5. 回滚至上一版本 1.0.0 并自动关闭 autoUpdate
+        # 5. 回滚至上一版本 2.0.0 并自动关闭 autoUpdate
         rb = updater.cmd_rollback(str(install_entry))
         self.assertTrue(rb["rolledBack"])
-        self.assertEqual("1.0.0", rb["version"])
+        self.assertEqual("2.0.0", rb["version"])
         self.assertFalse(rb["autoUpdate"])
+
+    def test_export_as_hap_mcp_app_builder_and_cleanup_legacy_v1_files(self):
+        import json
+        export_target = self.parent / "hap-skills" / "skills" / "mcp" / "hap-mcp-app-builder"
+        report = packager.package(self.root, export_dir=export_target, skill_name="hap-mcp-app-builder")
+        self.assertEqual("hap-mcp-app-builder", report["name"])
+        self.assertTrue((export_target / "version.json").is_file())
+        self.assertFalse((export_target / "release.json").exists())
+        self.assertIn("name: hap-mcp-app-builder\n", (export_target / "SKILL.md").read_text(encoding="utf-8"))
+        ver_meta = json.loads((export_target / "version.json").read_text(encoding="utf-8"))
+        self.assertEqual("hap-mcp-app-builder", ver_meta["name"])
+        self.assertEqual("2.0.0", ver_meta["version"])
+
+        # 模拟 1.0.0 覆盖安装后残留的旧文件，运行 scan_apps.py 应自动清理
+        (export_target / "plan" / "SKILL.md").write_text("legacy v1", encoding="utf-8")
+        (export_target / "build" / "SKILL.md").write_text("legacy v1", encoding="utf-8")
+        (export_target / "build" / "steps" / "12_cli_refinement.md").write_text("legacy v1", encoding="utf-8")
+        res = subprocess.run([sys.executable, "-B", str(export_target / "scripts" / "scan_apps.py"), str(self.parent)],
+                             capture_output=True, text=True)
+        self.assertEqual(0, res.returncode, res.stderr)
+        self.assertFalse((export_target / "plan" / "SKILL.md").exists())
+        self.assertFalse((export_target / "build" / "SKILL.md").exists())
+        self.assertFalse((export_target / "build" / "steps" / "12_cli_refinement.md").exists())
 
 
 if __name__ == "__main__":

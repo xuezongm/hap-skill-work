@@ -5,10 +5,15 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
+import re
+import shutil
 import sys
 from zipfile import ZIP_DEFLATED, ZipFile
 
-ROOT_FILES = {"SKILL.md", "README.md", "HOST_ADAPTER.md", "MCP_SETUP.md", "LICENSE", "release.json", ".gitignore"}
+ROOT_FILES = {
+    "SKILL.md", "README.md", "HOST_ADAPTER.md", "MCP_SETUP.md",
+    "LICENSE", "version.json", ".gitignore",
+}
 DIRECTORY_SUFFIXES = {
     "agents": {".yaml", ".yml"},
     "workflows": {".md"}, "plan": {".md"}, "build": {".md"},
@@ -80,7 +85,8 @@ def collect_files(root: Path):
     return sorted(files), skipped
 
 
-def package(root: Path, output: Path = None, manifest_output: Path = None):
+def package(root: Path, output: Path = None, manifest_output: Path = None,
+            export_dir: Path = None, skill_name: str = None):
     root = root.resolve()
     if output is not None:
         output = output.expanduser().resolve()
@@ -88,27 +94,55 @@ def package(root: Path, output: Path = None, manifest_output: Path = None):
             raise ValueError("发布包必须写到 Skill 目录之外")
         if output.suffix.lower() != ".zip":
             raise ValueError("输出文件必须使用 .zip 扩展名")
+    if export_dir is not None:
+        export_dir = export_dir.expanduser().resolve()
+        if root == export_dir or root in export_dir.parents or export_dir in root.parents:
+            raise ValueError("导出目录必须位于当前源 Skill 目录树之外")
     files, skipped = collect_files(root)
-    release_meta = json.loads((root / "release.json").read_text(encoding="utf-8"))
+    release_meta = json.loads((root / "version.json").read_text(encoding="utf-8"))
     version = str(release_meta.get("version", "")).strip()
     if not version:
-        raise ValueError("release.json 缺少有效的 version 字段")
+        raise ValueError("version.json 缺少有效的 version 字段")
+    target_name = (skill_name or release_meta.get("name", "hap-mcp-app-builder")).strip()
     file_hashes = {rel.as_posix(): sha256_bytes((root / rel).read_bytes()) for rel in files}
     report = {
-        "name": release_meta.get("name", "hap-app-copilot"),
+        "name": target_name,
         "version": version,
         "fileCount": len(files),
         "files": [p.as_posix() for p in files],
         "excluded": skipped,
     }
+    if export_dir is not None:
+        if export_dir.exists():
+            shutil.rmtree(export_dir)
+        export_dir.mkdir(parents=True, exist_ok=True)
+        for rel in files:
+            dst = export_dir / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(root / rel, dst)
+        if skill_name:
+            skill_md_path = export_dir / "SKILL.md"
+            skill_md_text = skill_md_path.read_text(encoding="utf-8")
+            skill_md_text = re.sub(
+                r"^(---\nname:\s*)([^\n]+)(\n)",
+                rf"\g<1>{target_name}\g<3>",
+                skill_md_text,
+                count=1,
+            )
+            skill_md_path.write_text(skill_md_text, encoding="utf-8")
+            ver_json_path = export_dir / "version.json"
+            ver_data = json.loads(ver_json_path.read_text(encoding="utf-8"))
+            ver_data["name"] = target_name
+            ver_json_path.write_text(json.dumps(ver_data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        report["exportDir"] = str(export_dir)
     if output is not None:
         output.parent.mkdir(parents=True, exist_ok=True)
         # x 模式保护已有包；统一包内根目录，不依赖来源目录名或安装软链接。
         with ZipFile(output, "x", compression=ZIP_DEFLATED) as archive:
             for rel in files:
-                archive.write(root / rel, "hap-app-copilot/" + rel.as_posix())
+                archive.write(root / rel, "hap-mcp-app-builder/" + rel.as_posix())
         with ZipFile(output) as archive:
-            expected = {"hap-app-copilot/" + p.as_posix() for p in files}
+            expected = {"hap-mcp-app-builder/" + p.as_posix() for p in files}
             if set(archive.namelist()) != expected or archive.testzip() is not None:
                 raise ValueError("发布包清单或 ZIP 完整性校验失败")
         archive_sha = sha256_bytes(output.read_bytes())
@@ -118,7 +152,7 @@ def package(root: Path, output: Path = None, manifest_output: Path = None):
             manifest_output = manifest_output.expanduser().resolve()
             manifest_data = {
                 "schemaVersion": release_meta.get("schemaVersion", 1),
-                "name": release_meta.get("name", "hap-app-copilot"),
+                "name": release_meta.get("name", "hap-mcp-app-builder"),
                 "version": version,
                 "minToolsCount": release_meta.get("minToolsCount", 170),
                 "archivePath": "/api/skills/hap-app-copilot.zip",
@@ -132,13 +166,20 @@ def package(root: Path, output: Path = None, manifest_output: Path = None):
 
 
 def main():
+    default_skill_dir = Path(__file__).resolve().parents[2] / "hap-mcp-app-builder"
+    if not default_skill_dir.exists() and (Path(__file__).resolve().parents[2] / "hap-app-copilot").exists():
+        default_skill_dir = Path(__file__).resolve().parents[2] / "hap-app-copilot"
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--skill-dir", type=Path,
-                        default=Path(__file__).resolve().parents[2] / "hap-app-copilot")
+    parser.add_argument("--skill-dir", type=Path, default=default_skill_dir)
     parser.add_argument("--output", type=Path, help="生成 ZIP；省略时只检查并打印发布清单")
-    parser.add_argument("--manifest", type=Path, help="可选：生成配套 hap-app-copilot.manifest.json 的输出路径")
+    parser.add_argument("--manifest", type=Path, help="可选：生成配套 manifest.json 的输出路径")
+    parser.add_argument("--export-dir", type=Path, help="可选：将纯净发布文件导出至外部仓库目标目录（如 hap-skills/skills/mcp/hap-mcp-app-builder）")
+    parser.add_argument("--skill-name", type=str, help="可选：导出时覆盖 SKILL.md 与 version.json 中的技能标识名")
     args = parser.parse_args()
-    print(json.dumps(package(args.skill_dir, args.output, args.manifest), ensure_ascii=False, indent=2))
+    print(json.dumps(
+        package(args.skill_dir, args.output, args.manifest, args.export_dir, args.skill_name),
+        ensure_ascii=False, indent=2,
+    ))
 
 
 if __name__ == "__main__":

@@ -18,9 +18,14 @@ python3 skill-maintainer/scripts/package_copilot.py
 
 # 生成新的 ZIP，输出位置必须在 Skill 目录之外
 python3 skill-maintainer/scripts/package_copilot.py --output /absolute/path/to/hap-app-copilot.zip
+
+# 一键导出至公开仓库 mingdaocom/hap-skills（自动将标识名转为 hap-mcp-app-builder 并携带 version.json）
+python3 skill-maintainer/scripts/package_copilot.py \
+  --export-dir /Users/user/AI-work/应用搭建skill/.hap-copilot/hap-skills/skills/mcp/hap-mcp-app-builder \
+  --skill-name hap-mcp-app-builder
 ```
 
-其他安装位置使用 `--skill-dir` 指定 Skill 根目录。脚本校验必需文件、运行时映射及章节归属；生成后校验 ZIP 内容清单和完整性，拒绝覆盖已有同名包。
+其他安装位置使用 `--skill-dir` 指定 Skill 根目录。脚本校验必需文件、运行时映射及章节归属；传入 `--export-dir` 与 `--skill-name hap-mcp-app-builder` 时，会自动清空目标目录、复制全部白名单文件，并将导出目录下的 `SKILL.md` frontmatter `name` 与 `version.json` 的 `name` 自动改写为 `hap-mcp-app-builder`。生成 ZIP 时校验内容清单和完整性，拒绝覆盖已有同名包。
 
 发布目录、扩展名和排除项以脚本清单为准。`.DS_Store`、AppleDouble 文件、Python 缓存、虚拟环境、IDE 配置和本地运行产物被排除；未声明文件或目录、发布内容中的软链接会报错，维护者确认用途后再调整。不要直接压缩整个仓库，也不要依赖 `.gitignore` 自动过滤 ZIP。
 

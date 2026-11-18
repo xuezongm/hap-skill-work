@@ -127,7 +127,9 @@ LOCAL_STEP_SOURCE_MAP: Dict[str, List[str]] = {
 def default_paths() -> Tuple[Path, Path]:
     script_dir = Path(__file__).resolve().parent
     skills_repo = script_dir.parent.parent
-    copilot_dir = skills_repo / "hap-app-copilot"
+    copilot_dir = skills_repo / "hap-mcp-app-builder"
+    if not copilot_dir.exists() and (skills_repo / "hap-app-copilot").exists():
+        copilot_dir = skills_repo / "hap-app-copilot"
     ai_work_dir = skills_repo.parent.parent
     prod_dir = ai_work_dir / "Mingo" / "MDAgentService" / "assets" / "agents" / "prod"
     return copilot_dir, prod_dir

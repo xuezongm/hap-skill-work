@@ -12,7 +12,9 @@ import unittest
 
 
 MAINTAINER = Path(__file__).resolve().parents[1]
-COPILOT = MAINTAINER.parent / "hap-app-copilot"
+COPILOT = MAINTAINER.parent / "hap-mcp-app-builder"
+if not COPILOT.exists() and (MAINTAINER.parent / "hap-app-copilot").exists():
+    COPILOT = MAINTAINER.parent / "hap-app-copilot"
 spec = importlib.util.spec_from_file_location("copilot_sync", MAINTAINER / "scripts/sync_hap_copilot.py")
 sync = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(sync)

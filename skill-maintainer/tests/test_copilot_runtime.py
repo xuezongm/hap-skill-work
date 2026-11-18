@@ -11,7 +11,9 @@ from unittest.mock import patch
 import contextlib
 import io
 
-ROOT = Path(__file__).resolve().parents[2] / 'hap-app-copilot'
+ROOT = Path(__file__).resolve().parents[2] / 'hap-mcp-app-builder'
+if not ROOT.exists() and (Path(__file__).resolve().parents[2] / 'hap-app-copilot').exists():
+    ROOT = Path(__file__).resolve().parents[2] / 'hap-app-copilot'
 
 
 def module(name):
@@ -61,6 +63,157 @@ class Fixture(unittest.TestCase):
 
 
 class RunTests(Fixture):
+    def test_reset_after_finalize_requires_fresh_report(self):
+        self.plan()
+        run = self.init()
+        task = self.prepare()['readyTasks'][0]
+        self.receipt(task, run['runId'])
+        self.assertTrue(runtime.cmd_finalize(str(self.app), None)['canAdvance'])
+        runtime.cmd_reset_task(str(self.app), task['taskId'])
+        rejected = runtime.cmd_advance(str(self.app))
+        self.assertFalse(rejected['advanced'])
+        self.assertEqual(task['taskId'], rejected['taskId'])
+        self.assertEqual('app_created', json.loads((self.app / 'hap-context.json').read_text())['progress'])
+
+    def test_finalize_separates_reset_capacity_and_running_tasks(self):
+        self.plan(('入库', '出库', '调拨'))
+        self.init()
+        reset, queued, active = [task['taskId'] for task in self.prepare()['readyTasks']]
+        runtime.cmd_record_dispatch(str(self.app), reset, 'agent-a', 'running')
+        runtime.cmd_reset_task(str(self.app), reset)
+        runtime.cmd_record_dispatch(str(self.app), queued, '', 'pending_capacity')
+        runtime.cmd_record_dispatch(str(self.app), active, 'agent-b', 'running')
+        report = runtime.cmd_finalize(str(self.app), None)
+        self.assertFalse(report['canAdvance'])
+        self.assertEqual(([reset], [queued], [active]), (
+            report['plannedTaskIds'], report['pendingCapacityTaskIds'], report['runningTaskIds']))
+        self.assertEqual([1, 1, 1], [report['taskSummary'][key] for key in ('planned', 'pendingCapacity', 'running')])
+
+    def test_delivery_status_uses_receipt_evidence_across_stages(self):
+        self.put('hap-plan.json', {'workflows': [{'name': '发布状态待核实', 'published': True},
+                                                  {'name': '等待成员'}, {'name': '已上线'}],
+                                   'worksheets': [{'name': '单据', 'customActions': [
+                                       {'name': '提交', 'type': 'triggerWorkflow'}]}]})
+        self.put('hap-context.json', {'appId': 'app-a', 'progress': 'config_completed'})
+        run_id = self.init()['runId']
+        for task in self.prepare()['readyTasks']:
+            if task['step'] == '5':
+                self.put(task['receiptPath'], {'taskId': task['taskId'], 'runId': run_id,
+                                               'status': 'failed', 'issues': ['缺少测试数据']})
+                continue
+            path = self.receipt(task, run_id)
+            receipt = json.loads(path.read_text())
+            outputs = {'processId': task['taskId']}
+            if '等待成员' in task['taskId']:
+                outputs['status'] = 'draft'
+            elif '已上线' in task['taskId']:
+                outputs['published'] = True
+            elif task['step'] == '11':
+                outputs.update({'worksheetName': '单据', 'actionName': '提交', 'actionEnabled': False})
+            receipt['outputs'] = outputs
+            self.put(task['receiptPath'], receipt)
+        page = 'step6-page-总览'
+        self.put(f'.build/receipts/{page}.json', {'taskId': page, 'runId': run_id,
+                 'outputs': {'completed': False, 'notes': ['缺库存趋势图']}})
+        self.put('.build/receipts/step6-page-旧项目.json', {'taskId': 'step6-page-旧项目',
+                 'runId': 'old', 'issues': ['历史遗留']})
+        report = runtime.cmd_finalize(str(self.app), None)
+        self.assertTrue(report['canAdvance'])
+        notes = {note['taskId']: note for note in report['deliveryNotes']}
+        self.assertEqual('unknown', notes['step10-sys-wf-发布状态待核实']['publicationStatus'])
+        self.assertEqual('unknown', notes['step11-act-wf-单据_提交']['publicationStatus'])
+        self.assertIs(False, notes['step11-act-wf-单据_提交']['actionEnabled'])
+        self.assertEqual('draft', notes['step10-sys-wf-等待成员']['publicationStatus'])
+        self.assertNotIn('step10-sys-wf-已上线', notes)
+        self.assertNotIn('step6-page-旧项目', notes)
+        self.assertEqual((False, ['缺库存趋势图']), (notes[page]['pageCompleted'], notes[page]['pageNotes']))
+        self.assertTrue(runtime.cmd_advance(str(self.app))['advanced'])
+        ctx = json.loads((self.app / 'hap-context.json').read_text())
+        self.assertFalse(ctx.get('sampleDataCreated'))
+        self.assertEqual('unknown', ctx['customActionWorkflowResults'][0]['status'])
+        self.assertIs(False, ctx['customActionWorkflowResults'][0]['actionEnabled'])
+        statuses = {item['name']: item['status'] for item in ctx['workflowResults']}
+        self.assertEqual({'发布状态待核实': 'unknown', '等待成员': 'draft', '已上线': 'published'}, statuses)
+        plan = json.loads((self.app / 'hap-plan.json').read_text())
+        flags = {wf['name']: wf.get('published') for wf in plan['workflows']}
+        self.assertEqual({'发布状态待核实': None, '等待成员': False, '已上线': True}, flags)
+
+    def test_rule_delivery_evidence_for_created_reused_and_inapplicable_rules(self):
+        self.put('.build/artifacts/worksheet-sheet-a.json', {'worksheetId': 'sheet-a',
+                 'fields': [{'name': '分类名称', 'id': 'name-id', 'type': 'Text', 'required': True}]})
+        cases = [
+            ({'rulesCreated': 0}, True),
+            ({'rulesCreated': 2}, True),
+            ({'ruleIds': [], 'noApplicableRulesReason': '   '}, True),
+            ({'ruleIds': ['']}, True),
+            ({'rulesCreated': 0, 'ruleIds': ['existing-rule']}, True),
+            ({'ruleIds': [], 'noApplicableRulesReason': '方案未列规则，已有必填和默认值'}, True),
+            ({'worksheetId': 'sheet-a', 'ruleIds': [], 'checkedFieldIds': ['wrong-id'],
+              'noApplicableRulesReason': '分类名称已必填'}, True),
+            ({'worksheetId': 'sheet-a', 'ruleIds': [], 'checkedFieldIds': ['name-id'],
+              'noApplicableRulesReason': '分类仅维护名称；空名称由字段必填拦截，无状态或跨字段条件'}, True),
+            ({'worksheetId': 'sheet-a', 'ruleIds': [], 'ruleChecks': [{
+                'intent': '分类必须有名称', 'fieldId': 'name-id', 'property': 'required',
+                'value': True, 'reason': '名称必填已覆盖这个条件'}]}, False),
+            ({'worksheetId': 'sheet-a', 'ruleIds': ['r1'], 'ruleChecks': [{
+                'intent': '不得重叠', 'ruleId': 'r1', 'name': '时间冲突', 'enabled': True,
+                'conditions': {'type': 'group', 'children': [{'type': 'condition', 'fieldId': 'name-id', 'operator': 'eq'}]}}]}, False),
+        ]
+        for outputs, missing in cases:
+            with self.subTest(outputs=outputs):
+                task_id = 'step3-view-act-订单'
+                self.put(f'.build/receipts/{task_id}.json', {
+                    'taskId': task_id, 'runId': 'run', 'step': '3', 'outputs': outputs})
+                notes = runtime.receipt_delivery_notes(str(self.app), 'run')
+                self.assertEqual(missing, any(n.get('ruleEvidenceMissing') for n in notes))
+
+    def test_incomplete_or_contradictory_booking_evidence(self):
+        outputs = {'worksheetId': 'venue', 'ruleIds': [], 'ruleChecks': [{
+            'intent': '名称必填', 'fieldId': 'title', 'property': 'required', 'value': True,
+            'reason': '字段属性已设置'}]}
+        self.put('.build/artifacts/worksheet-venue.json', {'worksheetId': 'venue',
+                 'fields': [{'id': 'title', 'type': 'Text', 'required': True}]})
+        self.assertFalse(runtime.has_rule_evidence(str(self.app), outputs, ['结束晚于开始']))
+        outputs['ruleChecks'][0]['value'] = False
+        self.assertFalse(runtime.has_rule_evidence(str(self.app), outputs))
+
+    def test_old_receipts_report_unknown_page_and_action(self):
+        for task in ['step6-page-A', 'step11-act-B']:
+            self.put(f'.build/receipts/{task}.json', {'taskId': task, 'runId': 'run',
+                                                       'outputs': {'status': 'published'}})
+        notes = {n['taskId']: n for n in runtime.receipt_delivery_notes(str(self.app), 'run')}
+        self.assertEqual('unknown', notes['step6-page-A']['pageCompleted'])
+        self.assertEqual('unknown', notes['step11-act-B']['actionEnabled'])
+
+    def test_dsl_field_attributes_preserve_known_and_unknown(self):
+        fields = [{'id': 'a', 'type': 'Text', 'isTitle': True, 'required': True,
+                   'defaultValue': [], 'layout': {'span': 6}, 'config': {'min': 0}},
+                  {'id': 'b', 'type': 'Number', 'required': False}, {'id': 'c', 'type': 'Text'}]
+        actual = merger.normalize_worksheet_shard(fields, 'ws', '预约')['fields']
+        for src, dest in zip(fields, actual):
+            for key, value in src.items():
+                self.assertEqual(value, dest[key])
+        self.assertNotIn('required', actual[2])
+        self.assertNotIn('isTitle', actual[2])
+
+    def test_role_task_projects_only_authorized_worksheet_action_ids(self):
+        self.put('hap-plan.json', {'worksheets': [{'name': n, 'fields': []} for n in ('订单', '订单/分支', '客户')],
+                                  'roles': [{'name': '申请人', 'permissions': ['订单(worksheet)']} ]})
+        self.put('hap-context.json', {'appId': 'app-a', 'progress': 'fields_refreshed',
+                                     'worksheetIdByName': {'订单': 'ws-a', '订单/分支': 'ws-b', '客户': 'ws-c'},
+                                     'actionIdByName': {'订单/提交': 'action-a', '订单/分支/提交': 'action-b',
+                                                        '客户/提交': 'action-c', '订单/缺失': ''}})
+        self.init()
+        task = next(t for t in self.prepare()['readyTasks'] if t['step'] == '8')
+        context = json.loads(Path(task['taskContext']).read_text())
+        self.assertEqual({'订单/提交': 'action-a'}, context['contextSlice']['actionIdByName'])
+        # 恢复旧工程时无动作映射仍可正常准备。
+        data = json.loads((self.app / 'hap-context.json').read_text())
+        del data['actionIdByName']
+        self.put('hap-context.json', data)
+        task = next(t for t in self.prepare()['readyTasks'] if t['step'] == '8')
+        self.assertEqual({}, json.loads(Path(task['taskContext']).read_text())['contextSlice']['actionIdByName'])
+
     def test_cli_requires_environment(self):
         result = self.cli('build_runtime.py', 'init', '--app-dir', str(self.app))
         self.assertNotEqual(0, result.returncode)
@@ -400,6 +553,38 @@ class RecoveryTests(Fixture):
         self.assertTrue(adv['advanced'])
         self.assertEqual('completed', adv['newProgress'])
 
+    def test_validate_plan_warns_same_action_intents_and_bad_explicit_view_bindings(self):
+        self.put('hap-plan.json', {
+            'worksheets': [
+                {'name': '调拨单', 'views': ['全部(Table)', '在途(Table)'], 'fields': []},
+                {'name': '出库单', 'views': ['待出库(Table)'], 'fields': []},
+            ],
+            'customActions': [{'worksheet': '调拨单', 'actions': [
+                {'name': '确认调出', 'type': 'triggerWorkflow', 'intentHints': [{'label': '确认调出：更新状态及台账'}]},
+                {'name': '确认调入', 'type': 'triggerWorkflow', 'intentHints': [{'label': '确认调入：更新状态及台账'}]},
+                {'name': '作废', 'type': 'triggerWorkflow', 'intentHints': [{'label': '记录作废原因'}]},
+            ]}],
+            'customPages': [{'name': '工作台', 'components': ['待出库(View)', '在途(View)'],
+                             'viewBindings': {'待出库': {'worksheet': '调拨单', 'view': '待出库'},
+                                              '在途': {'worksheet': '调拨单', 'view': '在途'}}}],
+        })
+        report = runtime.cmd_validate_plan(str(self.app))
+        self.assertTrue(report['passed'])
+        self.assertTrue(any('意图相同' in w and '确认调出' in w and '确认调入' in w for w in report['warnings']))
+        self.assertTrue(any('调拨单/待出库' in w for w in report['warnings']))
+        self.assertFalse(any('调拨单/在途' in w for w in report['warnings']))
+
+    def test_validate_plan_legacy_and_malformed_optional_bindings_are_nonblocking(self):
+        self.put('hap-plan.json', {'worksheets': [{'name': '出库单', 'fields': [], 'views': ['全部(Table)']}],
+            'customPages': [{'name': '旧页面', 'components': ['全部(View)']},
+                            {'name': '新页面', 'components': ['全部(View)'],
+                             'viewBindings': {'全部': {'worksheet': '出库单', 'view': '全部'},
+                                              '异常': None}}]})
+        report = runtime.cmd_validate_plan(str(self.app))
+        self.assertTrue(report['passed'])
+        self.assertEqual(1, report['warningCount'])
+        self.assertIn('异常', report['warnings'][0])
+
     def test_validate_plan_catches_broken_relations_and_warns_inputless_trigger_actions(self):
         self.put('hap-plan.json', {
             'appName': '图书借阅',
@@ -455,6 +640,143 @@ class RecoveryTests(Fixture):
         ok_report = json.loads(ok_res.stdout)
         self.assertTrue(ok_report['passed'])
         self.assertEqual(0, ok_report['warningCount'])
+
+
+class TaskContextRegressionTests(Fixture):
+    def test_portal_flag_belongs_to_app_creation(self):
+        self.plan()
+        self.init()
+        for flag in (True, False, None):
+            plan = {} if flag is None else {'enableExternalPortal': flag}
+            self.put('hap-plan.json', plan)
+            creation = runtime.get_stage_tasks_definitions(str(self.app), 'step1')[0]
+            self.assertIs(creation['planSlice']['enableExternalPortal'], flag is True)
+            self.assertIn('create_app', creation['allowedTools'])
+            self.put('hap-context.json', {'appId': 'app-a', 'progress': 'config_completed'})
+            report = runtime.cmd_finalize(str(self.app), None)
+            self.assertTrue(report['canAdvance'])
+            self.assertEqual('completed', report['nextProgress'])
+
+    def test_brief_plan_dispatches_domain_specs_and_explicit_exclusions(self):
+        pages = [{'name': name, 'type': 'workspace', 'components': ['待办(View)']}
+                 for name in ('工作台', '纯列表')]
+        pages[1]['requirements'] = ['本页不需要统计图']
+        self.put('hap-plan.json', {'worksheets': [{'name': '单据', 'views': ['待办(Table)']}],
+                                   'customPages': pages})
+        self.put('hap-context.json', {'appId': 'app-a', 'progress': 'worksheets_created'})
+        self.init()
+        tasks = self.prepare()['readyTasks']
+        tasks += runtime.cmd_prepare(str(self.app), 'fields_refreshed')['readyTasks']
+        references = {'3': 'hap-domain-view-spec.md', '5': 'hap-sample-data-spec.md',
+                      '6': 'hap-domain-custom-page-spec.md'}
+        targets = [task for task in tasks if task['step'] in references]
+        self.assertEqual(['3', '5', '6', '6'], sorted(t['step'] for t in targets))
+        for task in targets:
+            parts = [Path(f).read_text() for f in task['bundleFiles']]
+            self.assertIn('Plan 未逐项列出的配置也按规范补全', parts[0])
+            bundle = ''.join(parts)
+            self.assertIn(references[task['step']], bundle)
+            self.assertNotIn('同一轮并行 `read_file`', bundle)
+            if task['step'] == '6':
+                page = json.loads(Path(task['taskContext']).read_text())['planSlice']['page']
+                self.assertEqual(page['name'] == '纯列表', '本页不需要统计图' in bundle)
+
+    def test_worksheet_usage_only_includes_related_business_context(self):
+        self.plan(('预约', '场地'))
+        path = self.app / 'hap-plan.json'
+        plan = json.loads(path.read_text())
+        plan.update(roles=[{'name': '接待员', 'permissions': ['预约(worksheet)']}],
+                    workflows=[{'name': '预约提醒', 'trigger': {'source': '预约'}}],
+                    customActions=[{'worksheet': '场地', 'actions': [{'name': '开放'}]}])
+        path.write_text(json.dumps(plan))
+        self.init()
+        for task in self.prepare()['readyTasks']:
+            ctx = json.loads(Path(task['taskContext']).read_text())
+            usage = ctx['planSlice']['worksheetUsage']
+            booking = ctx['target']['name'] == '预约'
+            self.assertEqual(['预约提醒'] if booking else [], [w['name'] for w in usage['workflows']])
+            self.assertEqual(['接待员'] if booking else [], [r['name'] for r in usage['roles']])
+            self.assertEqual([] if booking else ['开放'], [a['name'] for a in usage['actions']])
+
+    def test_booking_constraints_reach_the_correct_worksheet_after_advance(self):
+        self.plan(('预约', '场地'))
+        run_id = self.init()['runId']
+        note = '结束时间应晚于开始时间'
+        for task in self.prepare()['readyTasks']:
+            path = self.receipt(task, run_id)
+            data = json.loads(path.read_text())
+            name = json.loads(Path(task['taskContext']).read_text())['target']['name']
+            data['outputs'] = {'worksheetName': name, 'worksheetId': 'sheet-' + name}
+            if name == '预约':
+                data['outputs'].update(businessRulesNotes=[note], relationLayout=[{
+                    'name': '预约场地', 'targetWorksheet': '场地', 'fieldType': 'Relation',
+                    'alias': 'venue', 'required': True}])
+            self.put(task['receiptPath'], data)
+        self.assertTrue(runtime.cmd_finalize(str(self.app), None)['canAdvance'])
+        self.assertTrue(runtime.cmd_advance(str(self.app))['advanced'])
+        group = self.prepare()['readyTasks'][0]
+        layout = json.loads(Path(group['taskContext']).read_text())['planSlice']['items'][0]['relationLayout']
+        self.assertTrue(layout[0]['required'])
+        tasks = runtime.cmd_prepare(str(self.app), 'worksheets_created')['readyTasks']
+        for task in tasks:
+            ctx = json.loads(Path(task['taskContext']).read_text())
+            expected = [note] if ctx['target']['name'] == '预约' else []
+            self.assertEqual(expected, ctx['contextSlice']['businessRulesNotes'])
+
+        # 已越过建表阶段，更新同一批次的有效回执后再次 prepare。
+        receipt_path = self.app / '.build/receipts/step2a-ws-预约.json'
+        receipt = json.loads(receipt_path.read_text())
+        receipt['outputs']['businessRulesNotes'] = ['时间段不可交叠']
+        receipt_path.write_text(json.dumps(receipt))
+        tasks = runtime.cmd_prepare(str(self.app), 'worksheets_created')['readyTasks']
+        booking = next(t for t in tasks if t['taskId'] == 'step3-view-act-预约')
+        self.assertEqual(['时间段不可交叠'], json.loads(Path(booking['taskContext']).read_text())
+                         ['contextSlice']['businessRulesNotes'])
+
+    def test_only_parent_task_gets_subtable_display_repair_access(self):
+        # 父子表可以由不同关联组构建：阶段 3 必须由父表任务核对最终列。
+        self.put('hap-plan.json', {'worksheets': [
+            {'name': '入库单', 'fields': ['入库明细(SubTable:入库明细)']},
+            {'name': '入库明细', 'worksheetType': 'subTable', 'parentWorksheet': '入库单',
+             'fields': ['物料(Relation:物料:single:uni)']},
+            {'name': '物料', 'fields': ['名称(Text)']},
+        ]})
+        self.put('hap-context.json', {'appId': 'app-a', 'progress': 'worksheets_created',
+            'worksheetIdByName': {'入库单': 'parent-id', '入库明细': 'child-id', '物料': 'material-id'},
+            'relationLayoutByWorksheet': {'入库单': [{'name': '入库明细', 'alias': 'biz_lines',
+                'fieldType': 'SubTable', 'targetWorksheet': '入库明细'}]}})
+        self.init()
+        tasks = self.prepare()['readyTasks']
+        loaded = [json.loads(Path(t['taskContext']).read_text()) for t in tasks]
+        contexts = {ctx['target']['name']: ctx for ctx in loaded}
+        parent, child = contexts['入库单'], contexts['入库明细']
+        self.assertIn('update_worksheet', parent['allowedTools'])
+        self.assertNotIn('update_worksheet', child['allowedTools'])
+        self.assertNotIn('update_worksheet', contexts['物料']['allowedTools'])
+        self.assertEqual([{'name': '入库明细', 'alias': 'biz_lines', 'worksheetName': '入库明细',
+                           'worksheetId': 'child-id'}], parent['contextSlice']['subtableDisplayChecks'])
+        self.assertEqual('step3-view-act-入库单', parent['taskId'])
+        self.assertTrue(Path(parent['sourceFiles']['worksheetContext']).is_absolute())
+
+    def test_workflow_bundles_preserve_full_context_and_legacy_role_mapping(self):
+        field = {'id': 'field-id', 'name': '状态', 'alias': 'biz_state', 'type': 'SingleSelect',
+                 'options': [{'key': 'key-a', 'value': '待审批'}], 'config': {'custom': 'preserve-me'}}
+        self.put('hap-plan.json', {'worksheets': [{'name': '出库单', 'fields': []}],
+            'workflows': [{'name': '库存预警', 'trigger': {'type': 'worksheet_event', 'source': '出库单'}}]})
+        self.put('hap-context.json', {'appId': 'app-a', 'progress': 'config_completed',
+            'worksheetIdByName': {'出库单': 'sheet-id'}, 'roleContext': [{'name': '仓管', 'id': 'old-role', 'note': '保留'}],
+            'roleIdByName': {'仓管': 'old-role', '审批人': 'role-new'}})
+        self.put('worksheetContext.json', {'worksheets': [{'worksheetId': 'sheet-id',
+            'worksheetName': '出库单', 'fields': [field]}]})
+        self.init()
+        standard = next(t for t in self.prepare()['readyTasks'] if t['step'] == '10')
+        full = json.loads(Path(standard['taskContext']).read_text())
+        standard_bundle = '\n'.join(Path(p).read_text() for p in standard['bundleFiles'])
+        self.assertEqual(field, full['worksheetContextSlice']['worksheets'][0]['fields'][0])
+        self.assertIn('preserve-me', standard_bundle)
+        self.assertEqual([{'name': '仓管', 'id': 'old-role', 'note': '保留'},
+                          {'name': '审批人', 'id': 'role-new'}], full['contextSlice']['roleContext'])
+        self.assertEqual('role-new', full['contextSlice']['roleIdByName']['审批人'])
 
 
 class TaskTests(Fixture):
@@ -748,7 +1070,7 @@ class BuildPipelineResilienceTests(Fixture):
             'worksheets': [{
                 'name': '报销单',
                 'fields': [],
-                'customActions': [{'name': '提交审批', 'type': 'triggerWorkflow', 'intentHints': ['发起审批']}],
+                'customActions': [{'name': '提交审批', 'type': 'triggerWorkflow', 'intentHints': ['发起审批'], 'enabled': False}],
             }],
         })
         self.put('hap-context.json', {
@@ -779,7 +1101,8 @@ class BuildPipelineResilienceTests(Fixture):
                 'worksheetId': ws_id,
                 'worksheetName': '报销单',
                 'views': [{'name': '全部记录', 'id': '6c0000000000000000000021', 'type': 'table'}],
-                'actions': [{'name': '提交审批', 'id': 'act-001', 'workflowId': 'wf-precreated-001'}],
+                'actions': [{'name': '提交审批', 'id': 'act-001', 'workflowId': 'wf-precreated-001',
+                             'createdByBuild': True, 'disabledForWorkflowSetup': True, 'initialEnabled': False}],
                 'rulesCreated': 0,
             },
             'verification': {'passed': True, 'evidence': ['已创建动作和视图']},
@@ -794,6 +1117,21 @@ class BuildPipelineResilienceTests(Fixture):
         step11_ctx = json.loads(Path(step11_task['taskContext']).read_text())
         self.assertEqual('wf-precreated-001', step11_ctx['contextSlice']['processId'])
         self.assertIn('get_custom_action_list', step11_ctx['allowedTools'])
+        self.assertIn('update_custom_action', step11_ctx['allowedTools'])
+        self.assertFalse(step11_ctx['planSlice']['actionWorkflow']['enabled'])
+        self.assertEqual('act-001', step11_ctx['contextSlice']['actionId'])
+        self.assertTrue(step11_ctx['contextSlice']['actionProvenance']['disabledForWorkflowSetup'])
+        bundle = '\n'.join(Path(p).read_text() for p in step11_task['bundleFiles'])
+        self.assertIn('成员为空或未知、未业务试跑只记录影响，不当作草稿理由', bundle)
+        self.assertIn('独立停用', bundle)
+
+    def test_action_workflow_keeps_explicit_status_and_does_not_invent_provenance(self):
+        plan = {'customActions': [{'worksheet': '单据', 'actions': [
+            {'name': '处理', 'type': 'triggerWorkflow', 'status': 0}]}]}
+        action = runtime.extract_action_workflows(plan, {})[0]
+        self.assertEqual(0, action['status'])
+        self.assertNotIn('enabled', action)
+        self.assertNotIn('createdByBuild', action)
 
 
 if __name__ == '__main__':
