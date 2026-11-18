@@ -7,7 +7,7 @@
 - **执行方式**：**主调度器内联执行**（在阶段 2 结束拿到全量页面、工作表与 AI 助手真实 ID 后，由主调度器内联按分组调用 `sort_app_items`，无需单独拉起 Subagent 或写回执文件）。
 - **输入来源**：`hap-plan.json`（`navGroups`、`worksheets`、`customPages`、`aiAssistants`）与 `hap-context.json`（`appId`、`sectionIdByName`、`worksheetIdByName`、`customPageIdByName`、`chatbotIdByName`）。
 - **必读领域规范**：`references/hap-domain-app-spec.md`
-- **准许调用工具**：`["sort_app_items"]`
+- **主要业务工具**：`["sort_app_items"]`
 
 ---
 

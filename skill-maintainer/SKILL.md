@@ -60,6 +60,8 @@ python3 {SKILL_DIR}/scripts/sync_hap_copilot.py --check
 
 同步工具、说明与执行入口仅保留在维护侧；公开发布的 `hap-app-copilot` 可保留来源信息，不包含同步功能说明或指向维护侧同步资料的入口。
 
+准备 Copilot 发布包时，按 [发布包维护](references/copilot-release.md) 核对依赖、许可证和文件范围，并运行维护侧打包检查。
+
 脚本结果只作为线索。语义重复、职责冲突和内容粒度必须人工判断。
 
 ### 3. 建立权威归属表

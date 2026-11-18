@@ -11,14 +11,14 @@
   - `contextSlice`：`appId`、`org_id`、`processId`（Step 3 按 `worksheet::action` 精确捕获的预建 `workflowId`）、`worksheetIdByName`、`roleContext`、`viewIdByName`；
   - `worksheetContextSlice`：已建工作表真实 `worksheetId` 及字段 `{ name, id, alias, type, options }`（含选项 `{ key, value, index }`）。
 - **必读领域规范**：`references/hap-workflow-design-guide.md`、`references/hap-domain-workflow-spec.md`
-- **准许工具白名单**：`["find_member", "find_department", "get_current_user", "get_worksheet_field", "get_worksheet_structure", "get_workflow_structure", "get_workflow_node", "get_workflow_variables", "update_workflow_node", "update_workflow_variables", "batch_create_process_nodes", "batch_delete_process_nodes", "validate_process", "publish_process", "get_sms_signatures"]`
+- **主要业务工具**：`["get_custom_action_list", "find_member", "find_department", "get_current_user", "get_worksheet_field", "get_worksheet_structure", "get_workflow_structure", "get_workflow_node", "get_workflow_variables", "update_workflow_node", "update_workflow_variables", "batch_create_process_nodes", "batch_delete_process_nodes", "validate_process", "publish_process", "get_sms_signatures"]`
 
 ---
 
 ## 二、 核心构建规则与执行步骤
 
 ### 1. 触发节点物理 `nodeId` 读取与数据源设计规则（核心铁律！）
-1. **核实预建 `processId`**：检查 `contextSlice.processId`（按 `worksheet::action` 精确绑定所属表动作，严禁跨表混用同名按钮）；若为空串，直接写入 `status: "skipped"` 回执结束。
+1. **核实预建 `processId`（支持线上动作列表自愈补齐）**：检查 `contextSlice.processId`（按 `worksheet::action` 精确绑定所属表动作，严禁跨表混用同名按钮）；若为空，立即调用 `get_custom_action_list(appId, worksheet_id: <所属表真实worksheetId>)` 查找同名按钮动作，直接读取其返回的 `workflowId` 作为 `processId` 继续执行，仅当前置按钮动作本身在线上不存在时才向主调度器报告依赖缺口。
 2. **首步读取物理 `nodeId`（严禁使用别名）**：
    - 自定义动作预建流程的触发节点**没有可用触发别名**！**绝对禁止**使用 `{ "nodeAlias": "trigger" }`（否则必触发 `StartNodeControlsIsNull` 错误）；
    - **第一步必须调用 `get_workflow_structure(workflow_id: processId)`**，提取触发节点的真实**物理 `nodeId`** 及真实数据源模式（单条 `single` / 多条批量 `multiple` / 表单提交后触发 `runWorkflowAfterSubmit`），后续所有节点引用触发记录一律使用 `{ "nodeId": "<真实触发nodeId>" }`，公式/模板占位符使用 `$<真实触发nodeId>-<24位真实fieldId>$`。
@@ -32,8 +32,8 @@
         - **驳回路径**：`update_record` 将状态回退为“已驳回 / 草稿”（真实选项 `key`）+ `send_notification` 通知申请人修改重提；
      3. **严禁只建孤立的 `approval_block` 漏写通过/驳回状态回写分支就发布上线！**
 
-### 2. Schema 前置核验、节点注入与校验上线（源自 `custom-action-workflow-sub-agent.yaml`）
-1. **懒加载 MCP 工具 Schema 前置必读（禁盲猜试错）**：调用 `batch_create_process_nodes` 前，若当前宿主为懒加载 MCP 环境（如 `<appDataDir>/mcp/{mcpServer}/batch_create_process_nodes.json`），**必须先用 `read_file` 读取该工具的 Schema 定义**，核准 `approval_block`、`branch`、`update_record` 与 `Condition.op` 结构，严禁靠报错盲目试错。
+### 2. 参数核实、节点注入与校验上线（源自 `custom-action-workflow-sub-agent.yaml`）
+1. **Lazy MCP Schema 必读与 `appId` 必传铁律**：若处于 Lazy-loaded MCP 环境（如 `call_mcp_tool`），首次调用 `get_workflow_structure`、`batch_create_process_nodes`、`update_workflow_node`、`validate_process`、`publish_process` 前**必须先读取对应的 `.json` Schema 文件**（遵循 [宿主适配](../../HOST_ADAPTER.md)）确认 `approval_block`、`branch`、`update_record`、`Condition.op` 结构，且所有应用内流程接口均须显式传入 `"appId": contextSlice.appId`。
 2. **组织身份解析**：需要固定人员、部门、当前请求用户或短信签名时，使用 `contextSlice.org_id` 调用 `find_member` / `find_department` / `get_current_user` / `get_sms_signatures` 解析真实身份；关键接收者缺失则保留 `draft` 如实说明。
 3. **批量创建节点**：调用 `batch_create_process_nodes(workflow_id: processId, nodes)` 注入完整节点链（流程内各 `nodeAlias` 保持唯一，不直接写只读衍生字段）。
 4. **内部块先内后外发布与主流程校验**：
@@ -44,6 +44,10 @@
 ---
 
 ## 三、 本地回执落盘契约
+
+> **顶层 `status` 与 `outputs.status` 严格区分铁律**：
+> - 顶层 `"status"` 表示**本搭建任务是否完成节点注入落库**（枚举仅 `"succeeded" | "failed"`）；`outputs.status` 表示**线上动作流的发布状态**（`"published" | "draft"`）。
+> - 当动作工作流节点链已成功写入线上流程，仅因固定接收人缺失、无可用短信签名等外部环境原因按规范保留草稿（`outputs.status: "draft"`）时，**顶层 `"status"` 必须写 `"succeeded"`** 并在 `issues` 如实记录待补齐项，**严禁将合法保留的草稿写成顶层 `"failed"`**！仅当预建 `processId` 不存在或节点完全未能落库时才写 `"failed"`。
 
 执行完成后，写入 `receiptPath`（`.build/receipts/step11-act-wf-{ws}_{name}.json`）：
 

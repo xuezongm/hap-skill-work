@@ -16,7 +16,7 @@ COPILOT = MAINTAINER.parent / "hap-app-copilot"
 spec = importlib.util.spec_from_file_location("copilot_sync", MAINTAINER / "scripts/sync_hap_copilot.py")
 sync = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(sync)
-STEP = "modify/steps/print_template.md"
+STEP = "modify/print-template-file.md"
 OLD_MIRROR = "references/hap-domain-print-template-spec.md"
 
 

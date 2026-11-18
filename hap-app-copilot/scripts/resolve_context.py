@@ -5,8 +5,8 @@ resolve_context.py
 HAP App Copilot 渐进加载上下文动态解析与章节级点读引擎。
 
 支持能力：
-1. --mode {plan,build,modify,audit} --assets/--domains ... [--render]：
-   按当前场景与目标领域计算最小参考清单，或直接渲染裁剪后的 Modify / Audit 上下文包；
+1. --mode {plan,build,modify,data} --assets/--domains ... [--render]：
+   按当前场景与目标领域计算最小参考清单，或直接渲染裁剪后的 Modify 上下文包；
 2. --file <rel_path> [--section <关键词> | --list-sections]：
    对大体积设计指南或领域 Spec 执行二级章节精准点读（对齐线上 load_skill(skillName, section)）；
 3. --validate：
@@ -138,55 +138,61 @@ MODIFY_DATA_SCENARIOS: Set[str] = {
     "dependency_governance",
 }
 
-AUDIT_CHECK_PREFIXES: Dict[str, str] = {
-    "STR": "structure",
-    "BIZ": "business",
-    "UX": "user_experience",
-    "PRF": "performance",
-    "SEC": "security",
+SCENARIO_POLICY_DOMAINS = {s: "record_data" for s in MODIFY_DATA_SCENARIOS}
+SCENARIO_POLICY_DOMAINS.update({"published_workflow": "workflow", "physical_delete": "worksheet"})
+
+# 复用操作卡的别名映射；这里只定义切片归属，不复制任何规则正文。
+POLICY_DOMAIN_BY_GUIDE_SECTION = dict(zip(MODIFY_GUIDE_SECTION_ORDER[1:], [
+    "app_navigation", "worksheet", "view_action", "role_permission",
+    "custom_page", "worksheet_chart", "chatbot", "print_template",
+    "public_form", "external_portal", "workflow", "record_data",
+]))
+
+DELETE_ROW_DOMAINS = {
+    "工作表已保存筛选器": {"worksheet"},
+    "常规及本表计算字段": {"worksheet"},
+    "普通视图": {"view_action"},
+    "打印模板": {"print_template"},
+    "自定义页面": {"custom_page"},
+    "统计图表": {"custom_page", "worksheet_chart"},
+    "AI 智能助手": {"chatbot"},
+    "表单业务规则": {"worksheet"},
+    "自定义动作": {"view_action"},
+    "指定工作流": {"workflow", "view_action", "chatbot"},
+    "物理索引": {"worksheet"},
+    "空角色": {"role_permission"},
+    "导航分组": {"app_navigation"},
+    "空工作表": {"worksheet"},
 }
 
-AUDIT_DIMENSION_SECTIONS: Dict[str, str] = {
-    "structure": "三、结构健康度",
-    "business": "四、业务完整度",
-    "user_experience": "五、用户体验",
-    "performance": "六、性能与容量",
-    "security": "七、安全与维护",
+BOUNDARY_ROW_DOMAINS = {
+    "自定义页面背景": {"custom_page"},
+    "自定义页面内容与外链": {"custom_page"},
+    "统计图表": {"custom_page", "worksheet_chart"},
+    "自定义动作": {"view_action", "workflow"},
+    "AI 智能助手": {"chatbot"},
+    "打印模板": {"print_template"},
+    "公开表单与外部门户": {"public_form", "external_portal"},
+    "角色合并": {"role_permission"},
+    "记录数据处理": {"record_data"},
 }
 
-COLLECTION_ASSET_SECTIONS: Dict[str, str] = {
-    "app": "应用与导航",
-    "navigation": "应用与导航",
-    "app_nav": "应用与导航",
-    "app_navigation": "应用与导航",
-    "external_portal": "公开表单与外部门户",
-    "portal": "公开表单与外部门户",
-    "worksheet": "工作表与字段",
-    "field": "工作表与字段",
-    "relation": "工作表与字段",
-    "layout": "工作表与字段",
-    "worksheet_filter": "视图与常用筛选",
-    "public_form": "公开表单与外部门户",
-    "view": "视图与常用筛选",
-    "action": "自定义动作",
-    "view_action": "视图与常用筛选",
-    "rule": "业务规则",
-    "business_rule": "业务规则",
-    "print_template": "打印模板",
-    "template": "打印模板",
-    "workflow": "工作流",
-    "role": "角色与权限",
-    "permission": "角色与权限",
-    "role_permission": "角色与权限",
-    "page": "自定义页面与图表",
-    "custom_page": "自定义页面与图表",
-    "page_chart": "自定义页面与图表",
-    "chart": "自定义页面与图表",
-    "worksheet_chart": "自定义页面与图表",
-    "chatbot": "AI 对话机器人",
-    "record": "业务数据",
-    "data": "业务数据",
-    "record_data": "业务数据",
+IMPACT_MIXED_ROW_DOMAINS = {
+    "修改应用名称、说明、图标或颜色": {"app_navigation"},
+    "修改单个或多个应用项导航名称/图标/显示模式/备注/用户说明": {"app_navigation"},
+    "新建、重命名或调整导航分组": {"app_navigation"},
+    "删除导航分组": {"app_navigation"},
+    "调整导航项顺序": {"app_navigation"},
+    "移动或隐藏入口": {"app_navigation"},
+    "原生公开表单启停与配置": {"public_form"},
+    "门户名称、登录页外观、协议及通知模板": {"external_portal"},
+    "启用并交付可用外部门户": {"external_portal"},
+    "门户启停、注册登录、讨论及资料控制": {"external_portal"},
+    "新建或修改 AI 助手": {"chatbot"},
+    "新建、修改或删除打印模板": {"print_template"},
+    "新建、修改、排序、删除或合并角色": {"role_permission"},
+    "新建、修改、发布、关闭或删除工作流": {"workflow"},
+    "结构修订连带记录数据与示例写入": {"record_data"},
 }
 
 
@@ -200,7 +206,7 @@ def resolve_files(
     scenarios: List[str] = None,
     step: str = None,
 ) -> List[str]:
-    files: Set[str] = set()
+    files: Set[str] = {"HOST_ADAPTER.md"}
     scenarios = scenarios or []
 
     if mode == "plan":
@@ -230,12 +236,9 @@ def resolve_files(
             "modify/execution-boundaries.md",
             "modify/modify_guide.md",
         ])
-    elif mode == "audit":
+    elif mode == "data":
         files.update([
-            "workflows/audit.md",
-            "audit/audit-checks.md",
-            "audit/collection-guide.md",
-            "scripts/audit_calc.py",
+            "workflows/data.md",
         ])
 
     step_mapping: Dict[str, List[str]] = {
@@ -273,7 +276,9 @@ def resolve_files(
         ],
     }
 
-    if step and step in step_mapping:
+    if step:
+        if mode != "build" or step not in step_mapping:
+            raise ValueError("--step 仅接受 Build 步骤：" + ", ".join(step_mapping))
         files.update(step_mapping[step])
 
     asset_mapping: Dict[str, List[str]] = {
@@ -312,8 +317,8 @@ def resolve_files(
             "references/hap-chart-design-guide.md",
         ],
         "chatbot": ["references/hap-domain-chatbot-spec.md"],
-        "print_template": ["modify/steps/print_template.md"],
-        "template": ["modify/steps/print_template.md"],
+        "print_template": ["modify/print-template-file.md"],
+        "template": ["modify/print-template-file.md"],
         "public_form": ["references/hap-domain-worksheet-spec.md"],
         "external_portal": ["references/hap-domain-external-portal-spec.md"],
         "portal": ["references/hap-domain-external-portal-spec.md"],
@@ -330,11 +335,15 @@ def resolve_files(
 
     for a in assets:
         key = a.strip().lower()
-        if key in asset_mapping:
-            files.update(asset_mapping[key])
+        if key not in asset_mapping:
+            raise ValueError(f"未知领域：{a}；可选值：" + ", ".join(sorted(asset_mapping)))
+        files.update(asset_mapping[key])
 
-    if mode == "modify" and {s.strip().lower() for s in scenarios}.intersection(MODIFY_DATA_SCENARIOS):
-        files.add("references/hap-domain-record-data-spec.md")
+    if mode == "modify":
+        for scenario in scenarios:
+            domain = SCENARIO_POLICY_DOMAINS.get(scenario.strip().lower())
+            if domain:
+                files.update(asset_mapping[domain])
 
     return sorted(list(files))
 
@@ -342,7 +351,7 @@ def resolve_files(
 def validate_all_mappings() -> bool:
     skill_root = get_skill_root()
     all_files: Set[str] = set()
-    for m in ["plan", "build", "modify", "audit"]:
+    for m in ["plan", "build", "modify", "data"]:
         all_files.update(resolve_files(m, []))
     for s in ["1", "1b", "2a", "2b", "3", "4a", "4b", "5", "6", "7", "8", "10", "11"]:
         all_files.update(resolve_files("build", [], step=s))
@@ -363,20 +372,53 @@ def validate_all_mappings() -> bool:
         for m in missing:
             print(f"  - {m}", file=sys.stderr)
         return False
+    # 不只核对路径：检查每个领域实际能命中对应操作卡和影响章节。
+    def read(rel_path: str) -> str:
+        with open(os.path.join(skill_root, rel_path), encoding="utf-8") as file_obj:
+            return file_obj.read()
+
+    guide = read("modify/modify_guide.md")
+    impact = read("modify/impact-map.md")
+    errors = []
+    guide_sections = {f"第 {number} 章" for number in re.findall(r"^##\s+([0-9]+)\.", guide, re.MULTILINE)}
+    for asset, sections in MODIFY_GUIDE_SECTION_MAPPING.items():
+        for section in sections:
+            if section not in guide_sections:
+                errors.append(f"{asset} 未命中操作卡 {section}")
+    for asset, sections in IMPACT_MAP_SECTION_MAPPING.items():
+        for section in sections:
+            try:
+                extract_markdown_section_by_keyword(impact, section)
+            except ValueError:
+                errors.append(f"{asset} 未命中影响章节 {section}")
+    try:
+        validate_policy_row_mappings(read("modify/safety-rules.md"),
+                                     read("modify/execution-boundaries.md"), impact)
+        for asset in all_assets:
+            render_modify_policy_bundle(resolve_files("modify", [asset]), [asset], [])
+    except ValueError as exc:
+        errors.append(str(exc))
+    if errors:
+        print("❌ 章节映射无效：\n" + "\n".join(errors), file=sys.stderr)
+        return False
     print(f"✅ 所有映射文件（共 {len(all_files)} 个）均真实存在且路径有效！")
+    print("✅ 领域操作卡、公共规则与表格行切片均能实际加载。")
     return True
 
 
 def reference_sections(rel_path: str, assets: List[str], scenarios: List[str]) -> List[str]:
     if rel_path == "modify/modify_guide.md":
+        domains = policy_domains(assets, scenarios)
+        if domains is None:
+            return list(MODIFY_GUIDE_SECTION_ORDER)
         sections = {"第 1 章"}
-        for asset in assets:
+        for asset in domains:
             for sec in MODIFY_GUIDE_SECTION_MAPPING.get(asset.strip().lower(), []):
                 sections.add(sec)
         if {s.strip().lower() for s in scenarios}.intersection(MODIFY_DATA_SCENARIOS):
             sections.add("第 13 章")
         return [s for s in MODIFY_GUIDE_SECTION_ORDER if s in sections]
-    if rel_path.startswith("modify/steps/"):
+    if rel_path == "modify/print-template-file.md":
         return ["仅文件制作或替换时读取；纯配置和删除跳过"]
     if rel_path.startswith("references/"):
         return ["使用 --file <path> --section <关键词> 按需点读"]
@@ -386,6 +428,8 @@ def reference_sections(rel_path: str, assets: List[str], scenarios: List[str]) -
 def reference_purpose(rel_path: str) -> str:
     if rel_path == "workflows/modify.md":
         return "Modify 内联执行流程与沟通红线"
+    if rel_path == "workflows/data.md":
+        return "Data 日常业务数据查询、增删改、审批处理与流程触发规范"
     if rel_path == "modify/impact-map.md":
         return "跨领域连带分类与固定依赖顺序"
     if rel_path == "modify/modify_guide.md":
@@ -394,11 +438,7 @@ def reference_purpose(rel_path: str) -> str:
         return "二元风险、14 类删除直通与数据阈值底线"
     if rel_path == "modify/execution-boundaries.md":
         return "平台能力边界与跨应用数据源引用规则"
-    if rel_path == "audit/audit-checks.md":
-        return "Audit 检查项、证据要求与评分规则"
-    if rel_path == "audit/collection-guide.md":
-        return "Audit 证据范围、接口选择与停止条件"
-    if rel_path.startswith("modify/steps/"):
+    if rel_path == "modify/print-template-file.md":
         return "本地文件制作步骤、HAP 专用语法与交付检查"
     if rel_path.endswith("-guide.md"):
         return "业务建模与设计指南"
@@ -425,6 +465,12 @@ def build_reference_records(
     return records
 
 
+def full_source_fallback(content: str, reason: str) -> str:
+    """运行时切片不适用时保留原文；维护侧 --validate 仍单独检查映射。"""
+    print(f"提示：{reason}，已回退加载完整原文。", file=sys.stderr)
+    return content.rstrip()
+
+
 def extract_guide_sections(content: str, requested_sections: List[str]) -> str:
     """从 modify_guide.md 提取指定的编号二级章节。"""
     lines = content.splitlines(keepends=True)
@@ -435,6 +481,8 @@ def extract_guide_sections(content: str, requested_sections: List[str]) -> str:
             heading_indexes.append((index, f"第 {match.group(1)} 章"))
 
     requested_keys = set(requested_sections)
+    if not heading_indexes or requested_keys - {key for _, key in heading_indexes}:
+        return full_source_fallback(content, "领域指南章节与截取映射不匹配")
     selected = []
     for position, (start, key) in enumerate(heading_indexes):
         if key not in requested_keys:
@@ -446,6 +494,9 @@ def extract_guide_sections(content: str, requested_sections: List[str]) -> str:
 
 def extract_impact_map_sections(content: str, assets: List[str], scenarios: List[str]) -> str:
     """从 impact-map.md 提取公共原则、命中领域的连带表格及固定顺序速查。"""
+    domains = policy_domains(assets, scenarios)
+    if domains is None:
+        return content.rstrip()
     lines = content.splitlines(keepends=True)
     h2_spans = []
     for idx, line in enumerate(lines):
@@ -453,18 +504,122 @@ def extract_impact_map_sections(content: str, assets: List[str], scenarios: List
             h2_spans.append((idx, line.strip()))
 
     needed_keywords = {"统一分类与交互原则", "跨领域固定依赖顺序速查"}
-    for a in assets:
+    for a in domains:
         for kw in IMPACT_MAP_SECTION_MAPPING.get(a.strip().lower(), []):
             needed_keywords.add(kw)
     if {s.strip().lower() for s in scenarios}.intersection(MODIFY_DATA_SCENARIOS):
         needed_keywords.add("AI 助手、打印模板、角色与工作流/数据")
 
+    if any(not any(kw in title for _, title in h2_spans) for kw in needed_keywords):
+        return full_source_fallback(content, "影响地图章节与截取映射不匹配")
     selected = []
     for pos, (start, title) in enumerate(h2_spans):
         end = h2_spans[pos + 1][0] if pos + 1 < len(h2_spans) else len(lines)
         if any(kw in title for kw in needed_keywords):
-            selected.extend(lines[start:end])
+            block = "".join(lines[start:end])
+            if "应用与导航" in title or "AI 助手、打印模板、角色与工作流/数据" in title:
+                # 同一二级章节可能含多个领域，进一步保留命中的原始表格行。
+                chunks = re.split(r"(?=^### )", block, flags=re.MULTILINE)
+                for index, chunk in enumerate(chunks):
+                    filtered, count = filter_policy_tables(chunk, IMPACT_MIXED_ROW_DOMAINS, domains)
+                    if index == 0 or count:
+                        selected.append(filtered)
+            else:
+                selected.append(block)
     return "".join(selected).rstrip()
+
+
+def policy_domains(assets: List[str], scenarios: List[str]):
+    """未指定领域或仅有设计/风格等宽泛标签时完整加载，不猜测操作范围。"""
+    if not assets or any(a.strip().lower() not in MODIFY_GUIDE_SECTION_MAPPING for a in assets):
+        return None
+    domains = {POLICY_DOMAIN_BY_GUIDE_SECTION[section]
+               for asset in assets
+               for section in MODIFY_GUIDE_SECTION_MAPPING[asset.strip().lower()]}
+    domains.update(SCENARIO_POLICY_DOMAINS[s.strip().lower()] for s in scenarios
+                   if s.strip().lower() in SCENARIO_POLICY_DOMAINS)
+    return domains
+
+
+def policy_row_key(line: str) -> str:
+    cell = line.split("|", 2)[1].strip().strip("*")
+    return re.sub(r"^\d+\.\s*", "", cell)
+
+
+def policy_table_keys(content: str) -> Set[str]:
+    return {policy_row_key(line) for line in content.splitlines()
+            if line.startswith("|") and not is_policy_table_header(line)}
+
+
+def is_policy_table_header(line: str) -> bool:
+    key = policy_row_key(line)
+    return key in {"对象类别", "领域能力", "变化"} or bool(re.fullmatch(r":?-+:?", key))
+
+
+def filter_policy_tables(content: str, row_domains: Dict[str, Set[str]], domains: Set[str]):
+    """只按第一列选择整行；出现未映射条目时保留整张原表。"""
+    lines = content.splitlines(keepends=True)
+    output = []
+    count = index = 0
+    while index < len(lines):
+        if not lines[index].startswith("|"):
+            output.append(lines[index])
+            index += 1
+            continue
+        table = []
+        while index < len(lines) and lines[index].startswith("|"):
+            table.append(lines[index])
+            index += 1
+        unknown = [policy_row_key(line) for line in table
+                   if not is_policy_table_header(line) and policy_row_key(line) not in row_domains]
+        if unknown:
+            print(f"提示：规则表格有未映射条目 {', '.join(unknown)}，已保留整张原表。", file=sys.stderr)
+            output.extend(table)
+            count += sum(not is_policy_table_header(line) for line in table)
+            continue
+        selected = []
+        for line in table:
+            if is_policy_table_header(line):
+                continue
+            key = policy_row_key(line)
+            if row_domains[key].intersection(domains):
+                selected.append(line)
+        if selected:
+            output.extend(line for line in table if is_policy_table_header(line) or line in selected)
+            count += len(selected)
+    return "".join(output), count
+
+
+def extract_policy_sections(content: str, domains, kind: str) -> str:
+    if domains is None:
+        return content.rstrip()
+    headings = list(re.finditer(r"^## .+$", content, flags=re.MULTILINE))
+    if not headings:
+        return full_source_fallback(content, f"{kind} 缺少可截取的二级标题")
+    selected = [content[:headings[0].start()]]
+    for index, heading in enumerate(headings):
+        title = heading.group()
+        end = headings[index + 1].start() if index + 1 < len(headings) else len(content)
+        block = content[heading.start():end]
+        if kind == "safety" and "记录数据修订硬约束" in title and "record_data" not in domains:
+            continue
+        if kind == "safety" and "删除与关闭轻量直通条件" in title:
+            block, _ = filter_policy_tables(block, DELETE_ROW_DOMAINS, domains)
+        elif kind == "boundary" and "核心领域能力边界矩阵" in title:
+            block, _ = filter_policy_tables(block, BOUNDARY_ROW_DOMAINS, domains)
+        selected.append(block)
+    return "".join(selected).rstrip()
+
+
+def validate_policy_row_mappings(safety: str, boundary: str, impact: str) -> None:
+    for content, query, mapping in [
+        (safety, "删除与关闭轻量直通条件", DELETE_ROW_DOMAINS),
+        (boundary, "核心领域能力边界矩阵", BOUNDARY_ROW_DOMAINS),
+        (impact, "应用与导航,AI 助手、打印模板、角色与工作流/数据", IMPACT_MIXED_ROW_DOMAINS),
+    ]:
+        actual = policy_table_keys(extract_markdown_section_by_keyword(content, query))
+        if actual != set(mapping):
+            raise ValueError(f"{query} 的表格行映射不完整：新增={sorted(actual - set(mapping))}，缺失={sorted(set(mapping) - actual)}")
 
 
 def extract_markdown_section_by_keyword(content: str, section_query: str = "", list_only: bool = False) -> str:
@@ -482,100 +637,21 @@ def extract_markdown_section_by_keyword(content: str, section_query: str = "", l
     queries = [q.strip().lower() for q in section_query.split(",") if q.strip()]
     header = lines[: h2_spans[0][0]] if h2_spans else lines
     matched = []
+    found_queries = set()
     for pos, (start, title) in enumerate(h2_spans):
         end = h2_spans[pos + 1][0] if pos + 1 < len(h2_spans) else len(lines)
         title_lower = title.lower()
-        if any(q in title_lower for q in queries):
+        hits = {q for q in queries if q in title_lower}
+        if hits:
+            found_queries.update(hits)
             matched.extend(lines[start:end])
 
-    if not matched:
+    if not matched or set(queries) - found_queries:
         toc = "\n".join(f"- {t}" for _, t in h2_spans)
-        return f"⚠️ 未找到匹配 '{section_query}' 的二级章节。当前文件可用章节如下：\n{toc}\n"
+        missing = ", ".join(sorted(set(queries) - found_queries)) or section_query
+        raise ValueError(f"未找到二级章节：{missing}。当前文件可用章节如下：\n{toc}")
 
     return "".join(header + matched).rstrip() + "\n"
-
-
-def extract_audit_checks(content: str, check_ids: List[str]) -> str:
-    lines = content.splitlines(keepends=True)
-    needed_dimensions: Set[str] = set()
-    for cid in check_ids:
-        match = re.match(r"CHK-([A-Z]+)-\d+", cid)
-        if match and match.group(1) in AUDIT_CHECK_PREFIXES:
-            needed_dimensions.add(AUDIT_CHECK_PREFIXES[match.group(1)])
-
-    section_spans = []
-    for index, line in enumerate(lines):
-        if re.match(r"^## ", line):
-            section_spans.append((index, line.strip()))
-
-    selected = []
-    check_id_set = set(check_ids)
-    for position, (start, title) in enumerate(section_spans):
-        end = section_spans[position + 1][0] if position + 1 < len(section_spans) else len(lines)
-        if "执行与证据契约" in title or "评分与评级算法" in title:
-            selected.extend(lines[start:end])
-            continue
-        matched_dimension = False
-        for dim, section_keyword in AUDIT_DIMENSION_SECTIONS.items():
-            if section_keyword in title and dim in needed_dimensions:
-                matched_dimension = True
-                break
-        if not matched_dimension:
-            continue
-        section_lines = lines[start:end]
-        header_added = False
-        for sline in section_lines:
-            if sline.startswith("## ") or sline.startswith("| 检查项") or sline.startswith("|---"):
-                selected.append(sline)
-                header_added = True
-            elif sline.startswith("| `CHK-"):
-                row_match = re.match(r"^\| `(CHK-[A-Z]+-\d+)`", sline)
-                if row_match and row_match.group(1) in check_id_set:
-                    selected.append(sline)
-            elif not header_added:
-                selected.append(sline)
-
-    return "".join(selected).rstrip()
-
-
-def extract_collection_sections(content: str, asset_types: List[str]) -> str:
-    lines = content.splitlines(keepends=True)
-    needed_subsections: Set[str] = set()
-    for at in asset_types:
-        key = at.strip().lower()
-        if key in COLLECTION_ASSET_SECTIONS:
-            needed_subsections.add(COLLECTION_ASSET_SECTIONS[key])
-
-    h2_spans = []
-    for index, line in enumerate(lines):
-        if re.match(r"^## ", line):
-            h2_spans.append((index, line.strip()))
-
-    selected = []
-    for position, (start, title) in enumerate(h2_spans):
-        end = h2_spans[position + 1][0] if position + 1 < len(h2_spans) else len(lines)
-        if "各类对象的读取规则" in title:
-            section_lines = lines[start:end]
-            h3_spans_local = []
-            for local_idx, sline in enumerate(section_lines):
-                if re.match(r"^### ", sline):
-                    h3_spans_local.append((local_idx, sline.strip()))
-            selected.append(section_lines[0])
-            if len(section_lines) > 1 and not section_lines[1].startswith("###"):
-                selected.append(section_lines[1])
-            for sub_pos, (sub_start, sub_title) in enumerate(h3_spans_local):
-                sub_end = h3_spans_local[sub_pos + 1][0] if sub_pos + 1 < len(h3_spans_local) else len(section_lines)
-                for needed in needed_subsections:
-                    if needed in sub_title:
-                        selected.extend(section_lines[sub_start:sub_end])
-                        break
-        else:
-            selected.extend(lines[start:end])
-
-    if h2_spans:
-        header = lines[: h2_spans[0][0]]
-        return "".join(header + selected).rstrip()
-    return "".join(selected).rstrip()
 
 
 def render_modify_policy_bundle(
@@ -587,14 +663,14 @@ def render_modify_policy_bundle(
     skill_root = get_skill_root()
     spec_paths = [p for p in resolved_rel_paths if p.startswith("references/")]
     references = build_reference_records(spec_paths, assets, scenarios, absolute=absolute)
-    step_paths = [p for p in resolved_rel_paths if p.startswith("modify/steps/")]
+    step_paths = [p for p in resolved_rel_paths if p == "modify/print-template-file.md"]
     metadata = {
         "mode": "modify",
         "assets": assets,
         "scenarios": scenarios,
         "specReferences": references,
         "stepReferences": build_reference_records(step_paths, assets, scenarios, absolute=absolute),
-        "note": "安全底线、能力边界、对应领域的连带影响表与操作卡已直接渲染；底层 references/hap-*.md 仅在构造复杂参数时用 --file <path> --section <关键词> 按需点读。",
+        "note": "公共底线必读，领域专属规则按原文截取；未指定领域时完整加载。新增领域或记录操作须先补充领域/场景重新加载。底层 references/hap-*.md 仅在构造复杂参数时用 --file <path> --section <关键词> 按需点读。",
     }
     parts = [
         "# Modify 最小上下文规则包",
@@ -607,18 +683,20 @@ def render_modify_policy_bundle(
     ]
 
     render_plan = [
-        ("modify/safety-rules.md", "full"),
-        ("modify/execution-boundaries.md", "full"),
+        ("modify/safety-rules.md", "safety"),
+        ("modify/execution-boundaries.md", "boundary"),
         ("modify/impact-map.md", "impact"),
         ("modify/modify_guide.md", "guide"),
     ]
     for rel_path, mode_tag in render_plan:
         abs_fp = os.path.join(skill_root, rel_path)
         if not os.path.exists(abs_fp):
-            continue
+            raise ValueError(f"必读规则文件不存在：{rel_path}")
         with open(abs_fp, "r", encoding="utf-8") as file_obj:
             content = file_obj.read()
-        if mode_tag == "impact":
+        if mode_tag in {"safety", "boundary"}:
+            content = extract_policy_sections(content, policy_domains(assets, scenarios), mode_tag)
+        elif mode_tag == "impact":
             content = extract_impact_map_sections(content, assets, scenarios)
         elif mode_tag == "guide":
             content = extract_guide_sections(content, reference_sections(rel_path, assets, scenarios))
@@ -631,63 +709,13 @@ def render_modify_policy_bundle(
     return "\n".join(parts).rstrip() + "\n"
 
 
-def render_audit_context(
-    resolved_rel_paths: List[str],
-    audit_checks: List[str],
-    audit_assets: List[str],
-) -> str:
-    skill_root = get_skill_root()
-    parts = ["# Audit 最小上下文", ""]
-
-    checks_path = os.path.join(skill_root, "audit", "audit-checks.md")
-    if os.path.exists(checks_path):
-        with open(checks_path, "r", encoding="utf-8") as f:
-            checks_content = f.read()
-        if audit_checks:
-            extracted = extract_audit_checks(checks_content, audit_checks)
-            parts.extend(["## 已加载：audit/audit-checks.md（按需提取）", "", extracted.rstrip(), ""])
-        else:
-            parts.extend(["## 已加载：audit/audit-checks.md（全文）", "", checks_content.rstrip(), ""])
-
-    guide_path = os.path.join(skill_root, "audit", "collection-guide.md")
-    if os.path.exists(guide_path):
-        with open(guide_path, "r", encoding="utf-8") as f:
-            guide_content = f.read()
-        if audit_assets:
-            extracted = extract_collection_sections(guide_content, audit_assets)
-            parts.extend(["## 已加载：audit/collection-guide.md（按需提取）", "", extracted.rstrip(), ""])
-        else:
-            parts.extend(["## 已加载：audit/collection-guide.md（全文）", "", guide_content.rstrip(), ""])
-
-    audit_path = os.path.join(skill_root, "workflows", "audit.md")
-    if "workflows/audit.md" in resolved_rel_paths and os.path.exists(audit_path):
-        with open(audit_path, "r", encoding="utf-8") as f:
-            audit_content = f.read()
-        parts.extend(["## 已加载：workflows/audit.md（全文）", "", audit_content.rstrip(), ""])
-
-    metadata = {
-        "mode": "audit",
-        "auditChecks": audit_checks if audit_checks else "all",
-        "auditAssets": audit_assets if audit_assets else "all",
-        "note": "检查项和采集章节已按需提取。",
-    }
-    parts.extend([
-        "## 按需参考清单",
-        "",
-        "```json",
-        json.dumps(metadata, ensure_ascii=False, indent=2),
-        "```",
-    ])
-    return "\n".join(parts).rstrip() + "\n"
-
-
 def main():
     parser = argparse.ArgumentParser(description="HAP App Copilot 上下文渐进加载与章节级点读引擎")
-    parser.add_argument("--mode", choices=["plan", "build", "modify", "audit"], default="modify", help="工作流模式")
+    parser.add_argument("--mode", choices=["plan", "build", "modify", "data"], default="modify", help="工作流模式")
     parser.add_argument("--assets", type=str, default="", help="目标资产/领域列表，逗号分隔 (如 worksheet,public_form,role_permission)")
     parser.add_argument("--domains", type=str, default="", help="--assets 的同义别名，逗号分隔")
     parser.add_argument("--scenarios", type=str, default="", help="可选复杂场景列表，逗号分隔")
-    parser.add_argument("--step", type=str, default="", help="Build 步骤编号 (如 2a, 3, 4b, 9a, 10)")
+    parser.add_argument("--step", type=str, default="", help="Build 步骤编号 (如 2a, 3, 4b, 10)")
     parser.add_argument("--file", type=str, default="", help="指定单个参考文件相对路径进行二级章节检索 (如 references/hap-app-design-guide.md)")
     parser.add_argument("--section", type=str, default="", help="配合 --file 按关键词点读二级章节正文 (逗号分隔可多选)")
     parser.add_argument("--list-sections", action="store_true", help="配合 --file 仅列出该文件的二级章节目录")
@@ -695,8 +723,6 @@ def main():
     parser.add_argument("--render", action="store_true", help="渲染输出裁剪后的 Modify 最小规则包")
     parser.add_argument("--absolute", action="store_true", help="输出绝对文件路径")
     parser.add_argument("--validate", action="store_true", help="自检所有映射文件的物理存在性")
-    parser.add_argument("--audit-checks", type=str, default="", help="Audit 检查项 ID 列表，逗号分隔")
-    parser.add_argument("--audit-assets", type=str, default="", help="Audit 采集资产类型列表，逗号分隔")
 
     args = parser.parse_args()
 
@@ -718,14 +744,10 @@ def main():
         parser.error("--render 与 --json 不能同时使用")
     if args.render and args.mode != "modify":
         parser.error("--render 仅支持 --mode modify")
-    if (args.audit_checks or args.audit_assets) and args.mode != "audit":
-        parser.error("--audit-checks 和 --audit-assets 仅支持 --mode audit")
 
     raw_assets = ",".join(x for x in (args.assets, args.domains) if x)
     assets = [a.strip() for a in raw_assets.split(",") if a.strip()]
     scenarios = [s.strip() for s in args.scenarios.split(",") if s.strip()]
-    audit_checks = [c.strip() for c in args.audit_checks.split(",") if c.strip()]
-    audit_assets = [a.strip() for a in args.audit_assets.split(",") if a.strip()]
 
     unknown_scenarios = sorted({s.lower() for s in scenarios} - MODIFY_COMPLEX_SCENARIOS)
     if args.mode == "modify" and unknown_scenarios:
@@ -739,8 +761,6 @@ def main():
 
     if args.render:
         print(render_modify_policy_bundle(resolved_rel_paths, assets, scenarios, absolute=args.absolute), end="")
-    elif args.mode == "audit" and (audit_checks or audit_assets):
-        print(render_audit_context(resolved_rel_paths, audit_checks, audit_assets), end="")
     elif args.json:
         references = build_reference_records(resolved_rel_paths, assets, scenarios, absolute=args.absolute)
         output_data = {
@@ -760,4 +780,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except ValueError as exc:
+        print(f"错误：{exc}", file=sys.stderr)
+        sys.exit(2)

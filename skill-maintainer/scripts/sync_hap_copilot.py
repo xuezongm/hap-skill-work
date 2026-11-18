@@ -111,11 +111,15 @@ MODIFY_YAML_LIST: List[str] = [
     "modify-app/record-data-revision-sub-agent.yaml",
 ]
 
-# 本地适配步骤仅检查文件存在性与来源标记，不覆盖正文或比较服务端专用协议。
+# 本地适配规程仅检查文件存在性与来源标记，不覆盖正文或比较服务端专用协议。
 LOCAL_STEP_SOURCE_MAP: Dict[str, List[str]] = {
-    "modify/steps/print_template.md": [
+    "modify/print-template-file.md": [
         "skills/hap-domain-print-template-spec/SKILL.md",
         "modify-app/print-template-revision-sub-agent.yaml",
+    ],
+    "workflows/data.md": [
+        "app-query-agent.yaml",
+        "skills/hap-data-agent-rules/SKILL.md",
     ],
 }
 

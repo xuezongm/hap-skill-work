@@ -78,7 +78,10 @@
    - `type: "workspace"` 必填 `components`（紧凑格式 `"名称(Type)"`，`Type` ∈ `Button | View | Text | Carousel | Section`）。
 2. **`customActions`（按工作表分组的自定义动作数组）**：
    - 元素结构：`{ "worksheet": "工作表名", "requirements"?, "actions": [{ "name", "description", "type", "runWorkflowAfterSubmit"?, "targetWorksheet"?, "relateFieldName"?, "enableCondition"?, "intentHints"?, "requirements"? }] }`。
-   - `type` ∈ `"updateCurrentRecord"` | `"createRelatedRecord"`（必填 `targetWorksheet` 与源表已存在的 `relateFieldName`） | `"triggerWorkflow"`（必填 `intentHints: [{ "label": "..." }]`）。表单动作提交后需紧接自动流转时设 `runWorkflowAfterSubmit: true` 并配 `intentHints`。
+   - **三类 `type` 人工输入边界铁律（严禁选错类型！）**：
+     - `"createRelatedRecord"`：**操作需收集人工输入并在另一张表新增记录**（如在 `图书` 点「发起借阅」填读者与应还日期新建 `借阅记录`，或在 `借阅记录` 点「登记异常」新建 `异常赔偿`）。必填 `targetWorksheet` 与源表 `fields` 中**已显式声明**的 `relateFieldName`（指向 `targetWorksheet` 的 `Relation` 字段名；若源表尚未声明该关联字段，必须先在源表 `fields` 补上该 `Relation` 字段！）；提交后需自动改状态/扣库存则设 `runWorkflowAfterSubmit: true` 并配 `intentHints`。
+     - `"updateCurrentRecord"`：**操作需收集人工输入以更新当前记录字段**（如在 `借阅记录` 点「申请续借」输入新应还日期与续借原因）。当前表 `fields` 中必须真实存在对应承接字段，并在动作 `requirements` 中指明待填字段名；提交后需自动流转则设 `runWorkflowAfterSubmit: true` 并配 `intentHints`。
+     - `"triggerWorkflow"`：**仅限 100% 零人工输入的一键自动操作**（点击后不弹任何表单，仅依赖当前记录已有字段、`triggerUser` 与当前系统时间即可完成，如「确认归还」「提交审批」）。必填 `intentHints: [{ "label": "..." }]`，严禁将需要点击人现场输入读者、日期、金额、原因或类型的动作设为 `"triggerWorkflow"`！
 3. **`workflows`（系统自动化工作流数组）**：
    - 元素结构：`{ "name", "description", "trigger": { "type": "worksheet_event | schedule | date_field", "source": "工作表名或空串", "label": "触发条件描述" }, "intentHints": [{ "label": "..." }], "requirements"? }`（注：按钮动作流写在 `customActions` 中，不放入 `workflows`）。
 4. **`roles`（角色权限数组）**：
@@ -93,4 +96,5 @@
 1. `navGroups` 100% 逐字覆盖所有工作表、自定义页面与 AI 助手的 `groupName`；所有 `icon` 均带合法 `sys_` 前缀；
 2. 所有 `worksheetType: "subTable"` 子表均在 `parentWorksheet` 主表 `fields` 中有唯一对应的 `SubTable` 字段及至少 1 个 `Rollup` 字段；
 3. 跨表关联严格遵守 `:bi` 单边发起、对端 `:reverse`、字典 `:uni`，零双边重复 `:bi`；
-4. 所有 `triggerWorkflow` 及 `runWorkflowAfterSubmit: true` 的动作均包含完整的 `intentHints`。
+4. **自定义动作输入入口闭环**：逐个检查 `customActions`——凡需人工输入信息的动作严禁用 `triggerWorkflow`；`createRelatedRecord` 的 `relateFieldName` 在源表 `fields` 中真实存在且指向 `targetWorksheet`；`updateCurrentRecord` 待填字段在当前表 `fields` 中真实存在；严禁出现「审批通过/审批驳回」按钮；
+5. 所有 `triggerWorkflow` 及 `runWorkflowAfterSubmit: true` 的动作均包含完整的 `intentHints`。

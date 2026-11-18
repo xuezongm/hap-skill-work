@@ -8,7 +8,7 @@
 - **执行方式**：主调度器极速内联执行（建壳、建分组、建页面空壳），随后紧接阅读 `build/steps/1b_update_app_desc.md` 内联更新应用说明与使用手册，一并将物理 ID 写入 `hap-context.json` 并置 `progress = "app_created"`。
 - **输入数据来源**：`{PROJECT_ROOT}/.hap-copilot/apps/{appName}/hap-plan.json`（含 `org_id`、`appName`、`appIcon`、`appColor`、`navLayout`、`navColor`、`enableExternalPortal`、`requirements`、`navGroups`、`customPages`）。
 - **必读领域规范**：`references/hap-domain-app-spec.md`、`references/hap-icon-palette.md`
-- **准许工具白名单**：`["create_app", "create_app_sections", "create_app_items"]`
+- **主要业务工具**：`["create_app", "create_app_sections", "create_app_items"]`
 
 ---
 
@@ -20,7 +20,7 @@
    - 将顶层 `requirements` 中的导航与应用设置要求优先映射到 `create_app` 参数（应用介绍与使用手册交由异步 Step 1b 处理，本步**严禁传 `remark` 和 `desc`**）；
    - **`navLayout` 推断规则**（用户明确要求优先，如“顶部导航”→`top`、“树形导航”→`tree`、“分组导航”→`group`、“卡片导航”→`card`；未指定时默认 `group`，层级深选 `tree`，多独立业务域并列选 `top`，门户工作台型选 `card`）；
    - **`navColor` 推断规则**（仅限枚举 `appColor | white | gray | black`，不支持自定义 HEX：蓝/绿/紫等深色主题默认 `appColor`；红/橙/黄等亮色主题选 `white`；重工/监控中心选 `black`；明确要求灰色选 `gray`）。
-2. **调用 `create_app`（仅一次，失败即阻断）**：
+2. **调用 `create_app`**（参数核实与异常恢复遵循 [宿主适配](../../HOST_ADAPTER.md)，成功后复用真实 `appId`）：
    - `orgId`：`hap-plan.json` 中的 `org_id`（必填，注意参数名为 `orgId` 而非 `projectId`）；
    - `name`：`appName`（必填）；
    - `icon`：`appIcon`（带 `sys_` 前缀的合法 `fileName`）；
@@ -41,7 +41,7 @@
    - `sectionId`：从 `sectionIdByName` 按 `groupName` 反查（查不到则省略）；
    - `remark`：根据页面 `description` 用 `appLanguage` 生成一句简洁业务定位说明。
 2. **一次性调用 `create_app_items`**：
-   - 当 `customPages` 非空时，将全部页面合并到同一次 `create_app_items(appId, items)` 调用中（成功后严禁二次调用）；
+   - 当 `customPages` 非空时，将全部页面合并到同一次 `create_app_items(appId, items)` 调用中（已成功页面不重复创建，部分失败只补缺项）；
    - 从返回结果提取每个页面的真实 24 位 hex `id`，建立 `customPageIdByName`（`{ "<页面名>": "<pageId>" }`）与 `customPageContext`（`[{ "name", "pageId", "description" }]`）。
 
 ### Part C：写入应用直达链接卡片

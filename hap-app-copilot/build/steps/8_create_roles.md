@@ -9,7 +9,7 @@
   - `planSlice`：`role`（含 `name`、`description`、`roleScope`: `"general" | "externalPortal"`、`permissions` 紧凑数组、`requirements`）、`appLanguage`；
   - `contextSlice`：`appId`、`worksheetIdByName`、`viewsByWorksheet`（或 `viewIdByName`）、`actionsByWorksheet`、`customPageIdByName`、`chatbotIdByName`。
 - **必读领域规范**：`references/hap-domain-role-spec.md`、`references/hap-app-design-guide.md`（「角色权限」章节）
-- **准许工具白名单**：`["create_role", "get_role_list"]`
+- **主要业务工具**：`["create_role", "get_role_list"]`
 
 ---
 
@@ -34,9 +34,10 @@
    - `"页面名(customPage)"` → 反查真实 `pageId` 生成 `{ id: pageId, enable: true }` 放入 `pagePermissions`；
    - `"助手名(aiAssistant)"` → 反查真实 `chatbotId` 生成 `{ id: chatbotId, enable: true }` 放入 `chatbotPermissions`。
 
-### 3. 调用 `create_role` 与重名幂等自愈
+### 3. 调用 `create_role`、重名自愈与完建验收边界
 1. 调用 1 次 `create_role`：传 `appId`、`name`、`description`、`roleScope: role.roleScope || "general"`、`permissionScope: "0"`、`hideAppForMembers: "false"` 及三类权限数组（**严禁传入已废弃的旧参数 `type: "0"`**；三类权限至少一类非空）。
 2. **重名错误幂等救治**：若 `create_role` 返回角色名称重复/已存在错误，立即调用 `get_role_list(appId)` 提取同名已有角色的真实 `id` 视同成功输出，**严禁改名重试或二次调用 `create_role`**。
+3. **对象完成即成功（严禁因平台档位机制或下游未建流程标 `failed`）**：HAP 原生 `20`（本人）与 `30`（本人及下属）基于记录拥有者判定且不支持 API 配置关联扩展权限，按上述惯例完成近似映射即为标准正确实现；角色描述中涉及的审批职责将在阶段 4 工作流中引用本步产出的 `roleId` 落地——**只要取得非空真实 `roleId`，回执 `status` 必须写 `"succeeded"`**（权限边界备注可放入 `issues`），绝不可阻断阶段 4 工作流构建。
 
 ---
 

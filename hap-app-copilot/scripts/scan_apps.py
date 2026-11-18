@@ -31,7 +31,7 @@ def ensure_hidden_gitignore(hidden_root: str) -> None:
                 pass
 
 
-def scan_single_root(apps_dir: str, is_legacy: bool, seen_names: set) -> list:
+def scan_single_root(apps_dir: str, is_legacy: bool, seen_paths: set) -> list:
     items = []
     if not os.path.isdir(apps_dir):
         return items
@@ -45,18 +45,22 @@ def scan_single_root(apps_dir: str, is_legacy: bool, seen_names: set) -> list:
         if not os.path.isfile(plan_path):
             continue
 
+        real_path = os.path.realpath(entry_path)
+        if real_path in seen_paths:
+            continue
+        seen_paths.add(real_path)
         app_name = entry
+        plan = {}
+        ctx = {}
         try:
             with open(plan_path, "r", encoding="utf-8") as f:
                 plan = json.load(f)
+            if not isinstance(plan, dict):
+                plan = {}
             if plan.get("appName"):
                 app_name = plan["appName"]
         except Exception:
             pass
-
-        if is_legacy and app_name in seen_names:
-            continue
-        seen_names.add(app_name)
 
         ctx_path = os.path.join(entry_path, "hap-context.json")
         progress = None
@@ -66,15 +70,29 @@ def scan_single_root(apps_dir: str, is_legacy: bool, seen_names: set) -> list:
             try:
                 with open(ctx_path, "r", encoding="utf-8") as f:
                     ctx = json.load(f)
+                if not isinstance(ctx, dict):
+                    ctx = {}
                 progress = ctx.get("progress")
                 status = "completed" if progress == "completed" else "in_progress"
             except Exception:
                 pass
 
+        try:
+            with open(os.path.join(entry_path, ".build", "run.json"), encoding="utf-8") as f:
+                run = json.load(f)
+            if not isinstance(run, dict):
+                run = {}
+        except (OSError, ValueError):
+            run = {}
+
         items.append({
             "dir": entry,
             "appDir": entry_path,
             "appName": app_name,
+            "mcpServer": run.get("mcpServer") or ctx.get("mcpServer") or plan.get("mcpServer"),
+            "orgId": plan.get("org_id") or plan.get("orgId") or ctx.get("org_id") or ctx.get("orgId"),
+            "appId": ctx.get("appId"),
+            "runId": run.get("runId"),
             "progress": progress,
             "status": status,
             "legacyLocation": is_legacy,
@@ -87,12 +105,12 @@ def scan_apps():
     hidden_root = os.path.join(project_root, ".hap-copilot")
     ensure_hidden_gitignore(hidden_root)
 
-    seen_names = set()
+    seen_paths = set()
     results = []
     # 1. 优先扫描标准隐藏工作目录 {PROJECT_ROOT}/.hap-copilot/apps/
-    results.extend(scan_single_root(os.path.join(hidden_root, "apps"), False, seen_names))
+    results.extend(scan_single_root(os.path.join(hidden_root, "apps"), False, seen_paths))
     # 2. 兼容扫描历史目录 {PROJECT_ROOT}/apps/
-    results.extend(scan_single_root(os.path.join(project_root, "apps"), True, seen_names))
+    results.extend(scan_single_root(os.path.join(project_root, "apps"), True, seen_paths))
     return results
 
 

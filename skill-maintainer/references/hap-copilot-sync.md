@@ -1,6 +1,6 @@
-# 与 AgentService 的同步说明
+# Copilot 与 AgentService 的共享内容及同步规则
 
-本文说明当前同步脚本的实际行为，供 Skill 维护者使用。实现位于本维护 Skill 的 [同步脚本](../scripts/sync_hap_copilot.py)；同步清单和映射以该脚本为准。
+本文说明哪些内容共享、哪些文件经过本地适配、规则应在哪里维护，以及当前同步脚本的执行方式和检查边界，供 Skill 维护者使用。实现位于本维护 Skill 的 [同步脚本](../scripts/sync_hap_copilot.py)；同步清单和映射以该脚本为准，本文解释其维护约定，不另行定义业务规则。
 
 本文和同步工具属于维护侧资料，不放入公开发布的 `hap-app-copilot` 目录，也不从其 README 或业务入口引用。公开 Skill 可以保留来源说明，但不提供同步命令、维护工具入口或上游更新流程。
 
@@ -34,17 +34,39 @@
 | 门户与权限（2） | `hap-domain-external-portal-spec`、`hap-domain-role-spec` |
 | 工作流与记录（2） | `hap-domain-workflow-spec`、`hap-domain-record-data-spec` |
 
-`hap-domain-print-template-spec` 不在镜像清单内；Copilot 使用 `modify/steps/print_template.md` 承接本地文件制作。AgentService 的打印规范和提示词保持原样。
+`hap-domain-print-template-spec` 不在镜像清单内；Copilot 使用 `modify/print-template-file.md` 承接本地文件制作。AgentService 的打印规范和提示词保持原样。
 
 `--sync-specs` 只写这些规格文件。它不会改写目标 Skill 的入口、工作流、Build SOP、Modify 手册、安全规则、影响地图、Audit 指标或运行脚本。
 
+### 2.1 文件分类与权威位置
+
+下表本地路径相对于本仓库根目录，上游路径相对于 AgentService 的 `assets/agents/prod`。只有第一类要求正文镜像一致；同源适配文件保留业务依据，同时使用本地上下文、编排和交付方式。
+
+| 类型 | Copilot 文件 | 权威来源及维护方式 |
+|---|---|---|
+| 共享镜像（19 份） | `hap-app-copilot/references/{name}.md`，名称见上表 | 上游 `skills/{name}/SKILL.md` 定义通用规则；先修改上游，再同步规范化正文，不在镜像中独立维护另一套规则 |
+| 同源适配：方案（2 份） | `hap-app-copilot/plan/1a_plan_overview.md`、`hap-app-copilot/plan/1b_plan_schema.md` | 分别参考 `skills/hap-app-plan/SKILL.md`、`skills/hap-app-plan-builder-spec/SKILL.md`；人工维护本地方案与产物契约 |
+| 同源适配：构建（12 份） | `hap-app-copilot/build/steps/` 下全部步骤 | 对应 `build-app/` 下的子 Agent YAML；准确映射以脚本的 `BUILD_STEP_YAML_MAP` 为准，人工提取并适配执行顺序与规则 |
+| 同源适配：修订操作卡 | `hap-app-copilot/modify/modify_guide.md` | 对应脚本 `MODIFY_YAML_LIST` 中 12 个修订执行器；人工维护领域操作卡，不复制服务端任务包装 |
+| 同源适配：公共修订规则 | `hap-app-copilot/modify/safety-rules.md`、`hap-app-copilot/modify/impact-map.md`、`hap-app-copilot/modify/execution-boundaries.md` | 分别参考上游 `hap-revision-safety` / `hap-revision-execution` / `hap-revision-backup`、`hap-revision-impact-map`、`hap-revision-execution-boundaries`；通用规则变化时核对并适配本地对应文件，具体来源见各文件“同源基准” |
+| 同源适配：打印 | `hap-app-copilot/modify/print-template-file.md` | 参考服务端打印规范及执行器，保留本地精简文件规程；具体边界见第 7 节 |
+| 同源适配：数据与审批 | `hap-app-copilot/workflows/data.md` | 参考上游 `app-query-agent.yaml` 与 `skills/hap-data-agent-rules/SKILL.md` 取数/展示准则，剔除 `<workEnd />` 等云端专属标签并扩展本地记录写入、审批处理与 PBP 触发分级门禁 |
+| 本地运行支持 | `hap-app-copilot/SKILL.md`、`hap-app-copilot/HOST_ADAPTER.md`、`hap-app-copilot/workflows/`、`hap-app-copilot/build/CONTEXT.md`、`hap-app-copilot/build/OUTPUT_CONTRACT.md`、`hap-app-copilot/build/PROGRESS.md`、`hap-app-copilot/scripts/` | 本地入口、宿主工具适配、编排、上下文、回执和运行脚本；各职责文件定义本地运行契约，不要求与服务端文件全文相同 |
+| 本地发布与界面支持 | `hap-app-copilot/README.md`、`hap-app-copilot/agents/openai.yaml`、`hap-app-copilot/.gitignore` | 安装说明、界面元数据及忽略配置，不属于共享镜像 |
+
+### 2.2 “一致”的判断口径
+
+- **逐字节一致**：原始文件连同 frontmatter、引用路径和换行全部相同；当前镜像流程不以此为目标。
+- **规范化正文一致**：按第 1 节转换源文件后，与本地正文全文相同；这是 `--check` 对 19 份共享镜像的判定标准。
+- **业务规则与行为一致**：需要核对提示词、执行顺序、工具契约和相关回归；来源标记存在或正文镜像一致都不能单独证明这一点。
+
 ## 3. 执行方式
 
-要求 Python 3，且能够访问本地源目录和目标目录。以下变量应设为当前机器上真实的绝对路径；示例对应现有工作区布局：
+要求 Python 3，且能够访问本地源目录和目标目录。以下变量须替换为当前机器的实际绝对路径；来源可以是主工作树，也可以是检出已确认提交的独立工作树：
 
 ```bash
-HAP_SKILLS_ROOT='/Users/user/AI-work/应用搭建skill/skills'
-HAP_PROD_DIR='/Users/user/AI-work/Mingo/MDAgentService/assets/agents/prod'
+HAP_SKILLS_ROOT='/absolute/path/to/hap-skill-work'
+HAP_PROD_DIR='/absolute/path/to/MDAgentService/assets/agents/prod'
 ```
 
 ### 只检查，不修改文件
@@ -127,7 +149,7 @@ python3 "$HAP_SKILLS_ROOT/skill-maintainer/scripts/audit_skill.py" \
 
 ## 6. 领域通用规则与 AgentService 执行协议的归属
 
-2026-11-17 角色、记录数据和外部门户三份共享规格中的服务端专用协议归入对应 Agent 的 `prompt.system`。共享规格继续定义通用业务约束；目标提示词已有的协议直接复用，不复制第二份完整定义。下表的上游路径相对于 `assets/agents/prod`。
+共享规格定义通用业务约束，服务端专用协议由对应 Agent 的 `prompt.system` 承接。目标提示词已有的协议直接复用，不复制第二份完整定义。角色、记录数据和外部门户的职责归属如下，上游路径相对于 `assets/agents/prod`。
 
 | 共享规格 | 服务端专用协议及权威提示词 | 共享规格保留内容 / 本地核对点 |
 |---|---|---|
@@ -135,16 +157,22 @@ python3 "$HAP_SKILLS_ROOT/skill-maintainer/scripts/audit_skill.py" \
 | `hap-domain-record-data-spec` | `modify-app/record-data-revision-sub-agent.yaml`：停止条件对应的状态回执、示例生成策略、createdIds；`modify-app/app-revision-agent.yaml` 已有入口边界、跨批次解析与依赖阻断，直接复用 | 授权、数量阈值、冻结、防重、对账、停止条件及两阶段结转保留；本地按真实 rowIds 执行，不构造服务端任务包装 |
 | `hap-domain-external-portal-spec` | `modify-app/external-portal-revision-sub-agent.yaml` 与 `modify-app/app-revision-agent.yaml` 已有组织身份注入及附件交接协议，直接复用 | 当前组织、可信素材来源、素材优先级与权限边界保留；本地使用已核实组织 ID 和当前环境的附件读取能力 |
 
-这三份规格继续随 19 项白名单同步，不自动转换 YAML。共享规则后续仍先改上游 Skill，再同步公开镜像；仅服务端协议变化时改对应提示词。涉及本地也需要的新能力时另行评估本地流程，不能把专用协议重新塞回共享规格。当前同步检查不会发现迁移后提示词的遗漏，维护者须核对实际加载的提示词与关键流程回归。
+这三份规格随 19 项白名单同步，不自动转换 YAML。共享规则先改上游 Skill，再同步公开镜像；仅服务端协议变化时改对应提示词。涉及本地也需要的新能力时另行评估本地流程，专用协议不写入共享规格。当前同步检查不会发现提示词内容的遗漏，维护者须核对实际加载的提示词与关键流程回归。
 
-本次不改两份设计指南、公共安全规则、授权与数据阈值、公开 Skill 的 170 工具门禁及原有执行流程。同步说明和迁移记录继续仅保留在维护侧，不加入公开包或其 README。
+## 7. Copilot 打印本地文件规程的维护
 
-## 7. Copilot 打印本地 step 的维护
+打印是本地适配项，不镜像完整的服务端 Skill。`modify/print-template-file.md` 按读取原件、制作副本、校验、原生 MCP 上传组织，只保留 HAP 占位符、文件兼容和交付要求；通用排版教程、沙箱协议和内部辅助模块不进入公开包。
 
-打印是本地适配项，不再同步完整的服务端 Skill。`modify/steps/print_template.md` 按读取原件、制作副本、校验、原生 MCP 上传组织，只保留 HAP 占位符、文件兼容和交付要求；通用排版教程、沙箱协议和内部辅助模块不进入公开包。
-
-- 上游业务依据为 `skills/hap-domain-print-template-spec/SKILL.md`；执行来源为 `modify-app/print-template-revision-sub-agent.yaml`，均相对于 AgentService 的 `assets/agents/prod`。本次不改这两个上游文件。
-- 本地 `modify/modify_guide.md` 的打印操作卡负责纯配置与删除，文件新建或替换才读取 step；`scripts/resolve_context.py` 返回按需 step 引用，不把文件制作正文注入纯配置任务。
-- `--sync-specs` 仅覆盖 19 份镜像，既不重新生成旧打印镜像，也不覆盖 step。`--check` 检查 step 及其来源标记和上游文件存在；旧 `references/hap-domain-print-template-spec.md` 若残留，会作为白名单外文件报告。该旧文件在本次调整中移除，不扩大旧版清理开关的删除范围。
+- 上游业务依据为 `skills/hap-domain-print-template-spec/SKILL.md`；执行来源为 `modify-app/print-template-revision-sub-agent.yaml`，均相对于 AgentService 的 `assets/agents/prod`，由 AgentService 维护。
+- 本地 `modify/modify_guide.md` 的打印操作卡负责纯配置与删除，文件新建或替换才读取 step；`hap-app-copilot/scripts/resolve_context.py` 返回按需 step 引用，不把文件制作正文注入纯配置任务。
+- `--sync-specs` 仅覆盖 19 份镜像，既不生成打印镜像，也不覆盖 step。`--check` 检查 step 及其来源标记和上游文件存在；旧 `hap-app-copilot/references/hap-domain-print-template-spec.md` 若残留，会作为白名单外文件报告。该文件不在 `--clean-legacy` 的清理清单中，需维护者确认后单独处理。
 - step 是面向本地的人工适配，当前工具不自动提炼上游业务规则，也不检测语义变化。上游占位符、兼容、权限或验收规则调整时，维护者对照变更更新 step；仅沙箱协议变化时不复制到本地。安全规则仍在本地公共文件维护，不在 step 复制授权策略或改变 170 工具门禁。
 - [维护回归测试](../tests/test_print_step.py)覆盖：旧镜像不会被同步重新引入、step 不被覆盖、step 或来源缺失能报告、打印与模板别名均能加载 step，纯配置渲染不携带制作全文。同步工具、说明和验证脚本继续仅在维护侧。
+
+## 8. 后续更新的维护顺序
+
+1. **确定比较基线**：先在 AgentService 仓库执行 `git fetch origin`，以维护目标分支或指定版本确定来源基线，并检查相关未提交差异。脚本读取实际工作树；使用检出已确认基线的源工作树并显式传入 `--prod-dir`，不能仅凭工作树干净就认为它已包含最新上游变更。
+2. **判断规则归属**：共享通用规则先改上游 Skill；服务端专用协议改对应 Agent 提示词；本地宿主、编排和运行契约改本地职责文件。通用业务规则跨端适用时联动维护，不把同一完整定义复制到多个位置。
+3. **先检查，再按范围更新**：使用第 3 节的只读检查识别漂移并确认差异原因；需要同步时才执行 `--sync-specs --check`。同源适配文件按第 2.1 节人工核对；新增能力不在白名单内时先判断是否应纳入，再修改清单和必要映射。
+4. **验证受影响内容**：共享镜像执行正文检查；适配文件核对业务语义和工具契约；执行结构与引用检查，并根据实际行为变更运行对应回归。保持 170 工具门禁和原有业务执行规则，不因整理或同步顺带调整。
+5. **交付**：在当次维护报告中说明源版本、同步文件、人工适配文件、刻意保留的差异和验证结果；检查报告只读成功不等于完成新能力同步。文档和维护入口留在维护侧，提交及推送按用户明确指令执行。

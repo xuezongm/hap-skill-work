@@ -81,19 +81,27 @@ def normalize_field_type(raw_type):
     return "Unknown"
 
 
-def normalize_worksheet_shard(raw_data, expected_id, expected_name):
-    """标准化单个分片数据结构"""
-    # 支持 raw_data 直接是数组 (fields)、包含 data/template 或标准的 dict
-    ws_id = raw_data.get("worksheetId") or raw_data.get("id") or expected_id
-    ws_name = raw_data.get("worksheetName") or raw_data.get("name") or expected_name
+def normalize_worksheet_shard(raw_data, expected_id, expected_name, name_to_id=None, fallback_opts_by_ws=None):
+    """标准化单个分片数据结构（兼容 dsl 原始结构、标准分片对象或数组，并自动清洗 (isTitle) 与回填漏抄的选项 key）"""
+    name_to_id = name_to_id or {}
+    fallback_opts = (fallback_opts_by_ws or {}).get(expected_name, {})
+
+    if isinstance(raw_data, dict) and isinstance(raw_data.get("data"), dict):
+        raw_data = raw_data["data"]
+    if isinstance(raw_data, dict) and isinstance(raw_data.get("worksheet"), dict):
+        raw_data = raw_data["worksheet"]
+
+    ws_id = (raw_data.get("worksheetId") or raw_data.get("id") or expected_id) if isinstance(raw_data, dict) else expected_id
+    ws_name = (raw_data.get("worksheetName") or raw_data.get("name") or expected_name) if isinstance(raw_data, dict) else expected_name
 
     raw_fields = []
-    if "fields" in raw_data and isinstance(raw_data["fields"], list):
-        raw_fields = raw_data["fields"]
-    elif "template" in raw_data and isinstance(raw_data["template"], dict):
-        raw_fields = raw_data["template"].get("controls", [])
-    elif "controls" in raw_data and isinstance(raw_data["controls"], list):
-        raw_fields = raw_data["controls"]
+    if isinstance(raw_data, dict):
+        if "fields" in raw_data and isinstance(raw_data["fields"], list):
+            raw_fields = raw_data["fields"]
+        elif "template" in raw_data and isinstance(raw_data["template"], dict):
+            raw_fields = raw_data["template"].get("controls", [])
+        elif "controls" in raw_data and isinstance(raw_data["controls"], list):
+            raw_fields = raw_data["controls"]
     elif isinstance(raw_data, list):
         raw_fields = raw_data
 
@@ -101,12 +109,14 @@ def normalize_worksheet_shard(raw_data, expected_id, expected_name):
     for f in raw_fields:
         if not isinstance(f, dict):
             continue
-        field_id = f.get("controlId") or f.get("id") or f.get("fieldId") or ""
-        field_name = f.get("controlName") or f.get("name") or f.get("fieldName") or ""
+        raw_fid = str(f.get("controlId") or f.get("id") or f.get("fieldId") or "").strip()
+        marked_title = "(isTitle)" in raw_fid
+        field_id = raw_fid.replace("(isTitle)", "").strip()
+        field_name = str(f.get("controlName") or f.get("name") or f.get("fieldName") or "").replace("(isTitle)", "").strip()
         raw_type = f.get("type") or f.get("fieldType") or 2
         field_type = normalize_field_type(raw_type)
         alias = f.get("alias") or ""
-        is_title = bool(f.get("attribute") == 1 or f.get("isTitle") or f.get("is_title"))
+        is_title = bool(marked_title or f.get("attribute") == 1 or f.get("isTitle") or f.get("is_title"))
 
         norm_field = {
             "id": field_id,
@@ -117,7 +127,8 @@ def normalize_worksheet_shard(raw_data, expected_id, expected_name):
             "required": bool(f.get("required") or f.get("notNull")),
         }
 
-        # 提取选项（必须完整保留 key 与 index，供工作流选项赋值与示例数据使用）
+        # 提取选项（必须完整保留 key 与 index；若分片漏抄 key 则自动从 Step 2a fieldOptionsContext 兜底回填）
+        fb_map = fallback_opts.get(alias) or fallback_opts.get(field_name) or {}
         options = f.get("options")
         if options and isinstance(options, list):
             norm_options = []
@@ -128,27 +139,36 @@ def normalize_worksheet_shard(raw_data, expected_id, expected_name):
                         "value": val,
                         "isDelete": bool(opt.get("isDelete", False)),
                     }
-                    if opt.get("key"):
-                        opt_item["key"] = opt["key"]
-                    if "index" in opt:
-                        opt_item["index"] = opt["index"]
-                    else:
-                        opt_item["index"] = idx + 1
+                    opt_key = opt.get("key") or fb_map.get(val)
+                    if opt_key:
+                        opt_item["key"] = opt_key
+                    opt_item["index"] = opt["index"] if "index" in opt else idx + 1
                     norm_options.append(opt_item)
                 elif isinstance(opt, str):
-                    norm_options.append({"value": opt, "index": idx + 1, "isDelete": False})
+                    opt_item = {"value": opt, "index": idx + 1, "isDelete": False}
+                    if fb_map.get(opt):
+                        opt_item["key"] = fb_map[opt]
+                    norm_options.append(opt_item)
             norm_field["options"] = norm_options
+        elif fb_map and field_type in ("SingleSelect", "MultipleSelect", "Dropdown"):
+            norm_field["options"] = [
+                {"key": k, "value": v, "index": i + 1, "isDelete": False}
+                for i, (v, k) in enumerate(fb_map.items())
+            ]
 
-        # 提取关联元数据
-        data_source = f.get("dataSource") or f.get("relationWorksheetId") or ""
+        # 提取关联元数据（支持把表名归一化为真实 worksheetId，保留 selfRelation）
+        cfg = f.get("config") if isinstance(f.get("config"), dict) else {}
+        data_source = f.get("dataSource") or f.get("relationWorksheetId") or cfg.get("dataSource") or ""
+        if data_source in name_to_id:
+            data_source = name_to_id[data_source]
         if data_source:
             norm_field["dataSource"] = data_source
 
-        relation_field = f.get("relationField") or f.get("relationControlId") or ""
+        relation_field = f.get("relationField") or f.get("relationControlId") or cfg.get("relationField") or ""
         if relation_field:
             norm_field["relationField"] = relation_field
 
-        source_field = f.get("sourceField") or f.get("sourceControlId") or ""
+        source_field = f.get("sourceField") or f.get("sourceControlId") or cfg.get("sourceField") or ""
         if source_field:
             norm_field["sourceField"] = source_field
 
@@ -264,63 +284,89 @@ def validate_schema(worksheets, id_to_name, name_to_id, plan_data):
                 "message": f"工作表【{ws_name}】存在多个标题字段: {[tf.get('name') for tf in title_fields]}"
             })
 
+        ws_fields = ws.get("fields", [])
+        if not ws_fields:
+            errors.append({
+                "worksheet": ws_name,
+                "code": "EMPTY_WORKSHEET_FIELDS",
+                "message": f"工作表【{ws_name}】分片未包含任何有效字段"
+            })
+        fields_by_name = {f.get("name"): f for f in ws_fields if f.get("name")}
         ws_map[ws_id] = {
             "name": ws_name,
             "fields_by_id": fields_by_id,
             "fields_by_alias": fields_by_alias,
-            "fields": ws.get("fields", [])
+            "fields_by_name": fields_by_name,
+            "fields": ws_fields,
         }
 
-    # 跨表关联与 Lookup/Rollup 数据源强校验
+    # 跨表关联与 Lookup/Rollup 数据源校验（放行 selfRelation，分片衍生元数据缺项记为告警不误杀已建成工作表）
     for ws in worksheets:
         ws_id = ws["worksheetId"]
         ws_name = ws["worksheetName"]
         local_fields_by_id = ws_map[ws_id]["fields_by_id"]
         local_fields_by_alias = ws_map[ws_id]["fields_by_alias"]
+        local_fields_by_name = ws_map[ws_id]["fields_by_name"]
 
         def get_local_field(key):
-            return local_fields_by_id.get(key) or local_fields_by_alias.get(key)
+            return local_fields_by_id.get(key) or local_fields_by_alias.get(key) or local_fields_by_name.get(key)
 
         for f in ws.get("fields", []):
             ftype = f.get("type")
             fname = f.get("name")
 
-            # 6. Relation dataSource 校验
+            # 6. Relation dataSource 校验（selfRelation 为合法本表自关联）
             if ftype in ("Relation", "SubTable"):
                 ds = f.get("dataSource")
-                if ds and ds not in ws_map:
-                    errors.append({
+                if ds and ds != "selfRelation" and ds not in ws_map and ds not in name_to_id:
+                    warnings.append({
                         "worksheet": ws_name,
                         "field": fname,
-                        "code": "RELATION_DATASOURCE_NOT_FOUND",
-                        "message": f"工作表【{ws_name}】的关联字段【{fname}】指向的目标工作表不存在 (dataSource={ds})"
+                        "code": "RELATION_DATASOURCE_UNVERIFIED",
+                        "message": f"工作表【{ws_name}】关联字段【{fname}】数据源未在本应用分片内命中 (dataSource={ds})"
                     })
 
-            # 7. Lookup / Rollup 校验
+            # 7. Lookup / Rollup 校验（分片从 md 转写可能省略 relationField，记告警不阻断阶段推进）
             if ftype in ("Lookup", "Rollup"):
                 rf_key = f.get("relationField")
                 sf_key = f.get("sourceField")
+                if not rf_key:
+                    warnings.append({
+                        "worksheet": ws_name,
+                        "field": fname,
+                        "code": "DERIVED_RELATION_META_OMITTED",
+                        "message": f"工作表【{ws_name}】衍生字段【{fname}】分片未附带 relationField 元数据"
+                    })
+                    continue
 
-                rf = get_local_field(rf_key) if rf_key else None
+                rf = get_local_field(rf_key)
                 if not rf:
-                    errors.append({
+                    warnings.append({
                         "worksheet": ws_name,
                         "field": fname,
                         "code": "LOOKUP_RELATION_NOT_FOUND",
-                        "message": f"工作表【{ws_name}】的衍生字段【{fname}】所引用的关联字段不存在 (relationField={rf_key})"
+                        "message": f"工作表【{ws_name}】衍生字段【{fname}】关联字段未在分片内对齐 (relationField={rf_key})"
                     })
                 else:
                     target_ws_id = rf.get("dataSource")
+                    if target_ws_id == "selfRelation":
+                        target_ws_id = ws_id
+                    elif target_ws_id in name_to_id:
+                        target_ws_id = name_to_id[target_ws_id]
                     if not target_ws_id or target_ws_id not in ws_map:
-                        errors.append({
+                        warnings.append({
                             "worksheet": ws_name,
                             "field": fname,
                             "code": "LOOKUP_TARGET_WORKSHEET_NOT_FOUND",
-                            "message": f"工作表【{ws_name}】的衍生字段【{fname}】目标工作表不存在 (targetWs={target_ws_id})"
+                            "message": f"工作表【{ws_name}】衍生字段【{fname}】目标表未在分片内对齐 (targetWs={target_ws_id})"
                         })
                     elif sf_key:
                         target_ws = ws_map[target_ws_id]
-                        tf = target_ws["fields_by_id"].get(sf_key) or target_ws["fields_by_alias"].get(sf_key)
+                        tf = (
+                            target_ws["fields_by_id"].get(sf_key)
+                            or target_ws["fields_by_alias"].get(sf_key)
+                            or target_ws["fields_by_name"].get(sf_key)
+                        )
                         if not tf:
                             warnings.append({
                                 "worksheet": ws_name,
@@ -373,6 +419,37 @@ def main():
     id_to_name = {v: k for k, v in worksheet_id_by_name.items()}
     name_to_id = dict(worksheet_id_by_name)
 
+    # 构建 Step 2a 缓存的选项 key 兜底索引：{ws_name: {field_alias_or_name: {opt_value: opt_key}}}（兼容 list 与 dict 结构）
+    fallback_opts_by_ws = {}
+    raw_fopts = context_data.get("fieldOptionsContext") or []
+    if isinstance(raw_fopts, dict):
+        for comp_key, opt_list in raw_fopts.items():
+            if "." in str(comp_key) and isinstance(opt_list, list):
+                w_n, f_n = str(comp_key).split(".", 1)
+                val_to_key = {o["value"]: o["key"] for o in opt_list if isinstance(o, dict) and o.get("value") and o.get("key")}
+                if val_to_key:
+                    fallback_opts_by_ws.setdefault(w_n, {})[f_n] = val_to_key
+    elif isinstance(raw_fopts, list):
+        for w_opt in raw_fopts:
+            if not isinstance(w_opt, dict) or not w_opt.get("name"):
+                continue
+            f_map = {}
+            for fld_opt in w_opt.get("fields", []) or []:
+                if not isinstance(fld_opt, dict):
+                    continue
+                val_to_key = {
+                    o["value"]: o["key"]
+                    for o in (fld_opt.get("options") or [])
+                    if isinstance(o, dict) and o.get("value") and o.get("key")
+                }
+                if val_to_key:
+                    if fld_opt.get("alias"):
+                        f_map[fld_opt["alias"]] = val_to_key
+                    if fld_opt.get("name"):
+                        f_map[fld_opt["name"]] = val_to_key
+            if f_map:
+                fallback_opts_by_ws[w_opt["name"]] = f_map
+
     print(f"🔍 启动分片收集，预期工作表数量: {len(worksheet_id_by_name)}")
     print(f"📂 分片存储目录: {shards_dir}")
 
@@ -410,7 +487,7 @@ def main():
                 time.sleep(0.3)
 
         if raw_shard is not None:
-            norm_shard = normalize_worksheet_shard(raw_shard, ws_id, ws_name)
+            norm_shard = normalize_worksheet_shard(raw_shard, ws_id, ws_name, name_to_id, fallback_opts_by_ws)
             normalized_shards.append(norm_shard)
         else:
             print(f"❌ 读取分片文件失败 [{shard_file}]: {last_err}", file=sys.stderr)

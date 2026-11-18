@@ -10,7 +10,7 @@
   - `planSlice.appLanguage`：应用内容语言代码；
   - `contextSlice`：`appId`、`appSectionId`（按 `groupName` 查好的真实 `sectionId`）。
 - **必读领域规范**：`references/hap-domain-worksheet-spec.md`（若含自定义组件字段则按需查阅 `references/hap-domain-custom-field-spec.md`）
-- **准许工具白名单**：`["create_worksheet", "update_worksheet", "update_worksheet_settings"]`
+- **主要业务工具**：`["create_worksheet", "update_worksheet", "update_worksheet_settings"]`
 
 ---
 
@@ -44,7 +44,7 @@
 
 ### 3. 描述生成、建表调用与表单设置按需增强
 1. **描述文案必填**：生成表级 `remark`、原生 HTML 表级 `desc`（仅用 `<p>/<strong>/<br>`，禁转义实体）、按需 `importantNote`（`"#515151"`），以及每个输入字段的 `placeholder`、字段 `remark` 和按需 `desc`。
-2. **调用 `create_worksheet`（仅一次）**：
+2. **调用 `create_worksheet`**（成功后复用真实表 ID，异常按 [宿主适配](../../HOST_ADAPTER.md) 排查续作）：
    - 传入 `appId`、`name`、`alias`（`biz_xxx`）、`sectionId`（取 `appSectionId`）、`icon`（保留 `sys_` 前缀）、`displayType`（**当 `worksheetType === "subTable"` 时必须传 `2` 隐藏**，普通表传 `1` 或省略）、`createDefaultView: false`、`returnData: true`、`addRecordButtonName`、`fields`（Step B 过滤后的基础字段）。
    - 若建表成功后发现遗漏了非关联基础字段，仅可用 `update_worksheet.addFields` 增量补齐（修改已有字段用 `editFields`），**严禁二次调用 `create_worksheet`**。
 3. **按需调用 `update_worksheet_settings`（子表与纯字典表直接跳过，严禁发空请求）**：

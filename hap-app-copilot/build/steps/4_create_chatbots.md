@@ -9,10 +9,10 @@
 
 ## 一、 Step 4a：创建 AI 助手实体（`taskContext.step == "4a"`，阶段 2 执行）
 
-### 1. 输入与白名单
+### 1. 输入与主要业务工具
 - **输入切片**（`.build/task-context/step4-chatbot.json`）：`planSlice.aiAssistants`、`planSlice.worksheetsSummary`（表名与简介，用于撰写初始提示词）、`planSlice.appLanguage`；`contextSlice.appId`、`contextSlice.sectionIdByName`。
 - **必读领域规范**：`references/hap-domain-chatbot-spec.md`
-- **准许工具白名单**：`["create_chatbot"]`
+- **主要业务工具**：`["create_chatbot"]`
 
 ### 2. 核心规则与执行步骤（源自 `chatbot-create-sub-agent.yaml`）
 1. 若 `aiAssistants` 为空，不调用任何工具，直接输出空 `chatbotIdByName: {}` 成功回执。
@@ -49,19 +49,20 @@
 
 ## 二、 Step 4b：配置已建助手的关联工作流 `ai_agent` 节点（`taskContext.step == "4b"`，阶段 3 按助手并发执行）
 
-### 1. 输入与白名单
+### 1. 输入与主要业务工具
 - **输入切片**（`.build/task-context/step4b-chatbot-config-{name}.json`）：`planSlice.assistant`（含 `name`、`description`、`requirements`）、`planSlice.appLanguage`；`contextSlice.appId`、`contextSlice.chatbotId`、`contextSlice.viewIdByName`；`worksheetContextSlice`（已刷新工作表真实 ID 与别名）。
 - **必读领域规范**：`references/hap-domain-chatbot-spec.md`（第四、五节）
-- **准许工具白名单**：`["get_workflow_structure", "get_workflow_node", "update_workflow_node", "publish_process", "get_app_ai_models", "get_app_knowledge_list", "get_worksheet_structure", "get_view_structure"]`
+- **主要业务工具**：`["get_workflow_structure", "get_workflow_node", "update_workflow_node", "publish_process", "get_app_ai_models", "get_app_knowledge_list", "get_worksheet_structure", "get_view_structure"]`
 
 ### 2. 核心规则与执行步骤（源自 `chatbot-config-sub-agent.yaml`）
 1. **定位底层工作流节点**：`chatbotId` 同时就是该助手关联工作流的 `workflowId`（若 `chatbotId` 为空则直接跳过，绝不新建助手）。调用 `get_workflow_structure(workflow_id: chatbotId, version: "draft")` 定位 `ai_agent` 节点的 `nodeId`，再调用 `get_workflow_node` 读取当前节点配置。
 2. **绑定真实数据表与工具范围**：
    - 结合 `assistant.description`、`requirements` 与 `worksheetContextSlice` / `viewIdByName` 的真实 ID，选择必要的数据查询、统计、记录操作或知识检索配置（仅当明确需要知识库或特定模型时才调 `get_app_knowledge_list` / `get_app_ai_models`，本步骤不绑定 `callWorkflow`，不运行任何业务工具）；
    - 保留正常的 `input/file` 引用与既有 `toolId`，`tools` 数组完整保留未改项；若 `requirements` 要求只读或限定特定表范围，必须在节点工具配置中实际收窄/停用对应写工具，不能只写在提示词里；保持用户权限检查开启与写操作确认开启。
-3. **一次更新并发布生效**：
-   - 合并本节点所需变更，调用 1 次 `update_workflow_node`（`config` 传原生 JSON Object；若原配置已完全满足目标则免写）；
-   - 默认调用 `publish_process(workflow_id: chatbotId)` 发布生效（仅当 `requirements` 明确指定只存草稿时不发布；结果未知先核查发布版本，严禁盲目重放）。
+3. **一次更新并发布生效（完建优先）**：
+   - 先查阅 `update_workflow_node` 实时 Schema 核实 `ai_agent` 节点 `config` 结构，合并本节点所需变更后调用 1 次 `update_workflow_node`（`config` 传原生 JSON Object；若原配置已完全满足目标则免写）；
+   - 默认调用 `publish_process(workflow_id: chatbotId)` 发布生效（仅当 `requirements` 明确指定只存草稿时不发布；结果未知先核查发布版本，严禁盲目重放）；
+   - 若助手实体与核心数据表工具已生效，仅个别非核心资源（如环境暂无指定外部模型或可选知识库为空）无法绑定，保留可用配置完成发布，在 `outputs.notes` 与 `issues` 如实记录差异，顶层回执仍标记 `status: "succeeded"`。
 
 ### 3. Step 4b 回执格式（写入 `.build/receipts/step4b-chatbot-config-{name}.json`）
 ```json

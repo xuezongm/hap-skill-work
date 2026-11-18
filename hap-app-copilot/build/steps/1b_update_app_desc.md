@@ -7,7 +7,7 @@
 - **执行方式**：**主调度器内联执行**（紧接 Step 1 拿到 `appId` 后顺手调用 1 次 `update_app`，无需启动独立 Subagent，也无需生成 `.build/receipts/` 回执文件）。
 - **输入来源**：`{PROJECT_ROOT}/.hap-copilot/apps/{appName}/hap-plan.json`（`appName`、`appColor`、`language`、`requirements`、`roles`）与同目录下的 `overview.md`，以及 Step 1 刚获取的 `appId`。
 - **必读领域规范**：`references/hap-domain-app-spec.md`（重点参考第六节「场景一：全新编写使用手册」）
-- **准许调用工具**：`["update_app"]`
+- **主要业务工具**：`["update_app"]`
 
 ---
 

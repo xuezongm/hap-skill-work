@@ -11,7 +11,7 @@
   - `contextSlice`：`appId`、`org_id`（用作人员/部门查询的 `orgId`）、`worksheetIdByName`、`roleContext`（`[{ name, id, roleScope }]`）、`viewIdByName`；
   - `worksheetContextSlice`：已建工作表真实 `worksheetId` 及字段 `{ name, id, alias, type, options }`（含选项 `{ key, value, index }`）。
 - **必读领域规范**：`references/hap-workflow-design-guide.md`、`references/hap-domain-workflow-spec.md`
-- **准许工具白名单**：`["find_member", "find_department", "get_current_user", "get_worksheet_field", "get_worksheet_structure", "create_process", "get_workflow_structure", "get_workflow_node", "get_workflow_variables", "update_workflow_node", "update_workflow_variables", "batch_create_process_nodes", "batch_delete_process_nodes", "validate_process", "publish_process", "get_sms_signatures"]`
+- **主要业务工具**：`["find_member", "find_department", "get_current_user", "get_worksheet_field", "get_worksheet_structure", "create_process", "get_workflow_structure", "get_workflow_node", "get_workflow_variables", "update_workflow_node", "update_workflow_variables", "batch_create_process_nodes", "batch_delete_process_nodes", "validate_process", "publish_process", "get_sms_signatures"]`
 
 ---
 
@@ -28,13 +28,13 @@
      - **驳回路径**：调用 `update_record` 将状态回退为“已驳回/待修改”（真实选项 `key`）+ `send_notification` 通知发起人驳回信息以便修改重提。
 4. **人员与通知语义保真**：应用角色使用 `roleContext` 真实 `roleId`（`PersonRef { kind: "role", id }`）；固定姓名/部门调 `find_member`/`find_department`（`orgId` 传 `contextSlice.org_id`，不得传 `appId`，脱敏手机/邮箱不可外发）；“通知我”调 `get_current_user`（勿与运行时 `triggerUser` 混淆）；短信通知调 `get_sms_signatures` 取有效签名。关键接收者无法唯一定位时保留草稿（`status: "draft"`）说明缺口，严禁私自换人或删减必要节点强行发布。
 
-### 2. 物理创建、Schema 前置核验与发布流水线（源自 `workflow-build-sub-agent.yaml`）
-1. **懒加载 MCP 工具 Schema 前置必读（禁盲猜试错）**：
-   - 在构造 `create_process` 与 `batch_create_process_nodes` 参数前，若当前宿主为懒加载 MCP 环境（如 `<appDataDir>/mcp/{mcpServer}/batch_create_process_nodes.json`），**必须先用 `read_file` 读取对应工具的 Schema 定义**，核准 `approval_block`、`branch`、`update_record`、`Condition.op` 的精确入参格式，**严禁不读 Schema 盲猜参数靠接口报错反复试错**。
+### 2. 物理创建、参数核实与发布流水线（源自 `workflow-build-sub-agent.yaml`）
+1. **Lazy MCP Schema 必读与 `appId` 必传铁律**：
+   - 按 [宿主适配](../../HOST_ADAPTER.md) 核实参数：若处于 Lazy-loaded MCP 环境（如 `call_mcp_tool`），首次调用 `create_process`、`batch_create_process_nodes`、`update_workflow_node`、`validate_process`、`publish_process` 前**必须先读取对应的 `.json` Schema 文件**确认 `approval_block`、`branch`、`update_record`、`Condition.op` 结构及必填字段；所有应用内流程接口调用时均须显式传入 `"appId": contextSlice.appId`。
 2. **字段与选项铁律**：
    - 节点中引用业务 `fieldId` **必须使用 24 位真实 `id`，严禁传 `alias`**；
    - 给单选/多选/下拉字段赋值时，**必须且只能传选项的真实 `key`**，严禁传中文名 `value`！关联取数节点的目标表由来源关联字段自动推导，不传 `worksheetId`；严禁直接更新公式/汇总/他表只读衍生字段。
-3. **创建流程外壳**：若 `worksheet_event` / `date_field` 的触发工作表查不到真实表 ID，直接返回 `status: "skipped"` 不调工具；否则调用 `create_process(appId, name, description, publish: false, trigger)`，读取返回的 `processId` 与 **`triggerAlias`**（仅缺失 `triggerAlias` 时调 1 次 `get_workflow_structure` 兜底取 `trigger.nodeAlias`）。
+3. **创建流程外壳**：若 `worksheet_event` / `date_field` 的触发工作表 ID 缺失，先核对工程上下文与线上表列表；仍无法定位时报告依赖缺口，不伪造 ID 或跳过必需流程。定位后调用 `create_process(appId, name, description, publish: false, trigger)`，读取返回的 `processId` 与 **`triggerAlias`**（缺失 `triggerAlias` 时按需调用 `get_workflow_structure` 兜底取 `trigger.nodeAlias`）。
 4. **批量注入节点与内部块由内向外发布**：
    - 调用 `batch_create_process_nodes(workflow_id: processId, nodes)` 一次性或分组写入节点（触发记录引用使用 `triggerAlias`）；
    - 若含 `approval_block / sub_process / loop`，单独对其内部 `processId` 完成校验与 `publish_process`，**先内后外**。
@@ -45,6 +45,10 @@
 ---
 
 ## 三、 本地回执落盘契约
+
+> **顶层 `status` 与 `outputs.status` 严格区分铁律**：
+> - 顶层 `"status"` 表示**本搭建任务是否完成落库**（枚举仅 `"succeeded" | "failed"`）；`outputs.status` 表示**线上工作流的发布状态**（`"published" | "draft"`）。
+> - 当工作流外壳与完整业务节点链已成功落库，仅因外部固定接收人无法唯一定位、组织缺少短信签名等外部环境客观原因按规范保留草稿（`outputs.status: "draft"`）时，**顶层 `"status"` 必须写 `"succeeded"`** 并在 `issues` 如实列出待人工补齐项，**严禁将合法落库的草稿写成顶层 `"failed"` 阻断搭建闭环**！仅当 `create_process` 建壳失败或核心节点根本未落库时才写 `"failed"`。
 
 执行完成后，写入 `receiptPath`（`.build/receipts/step10-sys-wf-{name}.json`）：
 

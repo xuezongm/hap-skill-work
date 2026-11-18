@@ -8,7 +8,7 @@ HAP App Copilot 报告驱动型薄控制面运行时引擎 (Report-Driven Build 
 - 阶段 1 (step1): 创建应用、导航分组与自定义页面空壳 -> app_created
 - 阶段 1.5 (app_created -> step2a_done -> worksheets_created):
   Step 1b(后台使用手册) + Step 2a(基础表与字段并发，产出 relationLayout 与 fieldOptionsContext)
-  -> Step 2b(按 relationLayout 预留行号回填跨表关联与衍生字段，只写不回读)
+  -> Step 2b(按 relationLayout 预留行号回填跨表关联与衍生字段)
 - 阶段 2 (worksheets_created -> fields_refreshed):
   Step 3(单表结构采集 + 自定义动作 + 视图 + 四类业务规则) + Step 4a(AI助手实体创建)
   -> 自动触发 merge_worksheet_context.py 执行 10 项强校验合并
@@ -21,11 +21,13 @@ HAP App Copilot 报告驱动型薄控制面运行时引擎 (Report-Driven Build 
 
 import argparse
 import datetime
+import hashlib
 import json
 import os
 import subprocess
 import sys
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+from uuid import uuid4
 
 SYSTEM_WORKFLOW_TOOLS = [
     "find_member",
@@ -46,7 +48,9 @@ SYSTEM_WORKFLOW_TOOLS = [
     "get_sms_signatures",
 ]
 
-ACTION_WORKFLOW_TOOLS = [t for t in SYSTEM_WORKFLOW_TOOLS if t != "create_process"]
+ACTION_WORKFLOW_TOOLS = [t for t in SYSTEM_WORKFLOW_TOOLS if t != "create_process"] + [
+    "get_custom_action_list",
+]
 
 
 def load_json(filepath: str) -> Any:
@@ -79,9 +83,67 @@ def normalize_name(name: str) -> str:
     return "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in str(name)).strip("_")
 
 
+def canonical_stage(stage: str) -> str:
+    groups = {
+        "step1": ("", "initial"),
+        "app_created": ("step2a",),
+        "step2a_done": ("step2b",),
+        "worksheets_created": ("phase2_single_table",),
+        "fields_refreshed": ("phase3_configs", "page_shells_created", "phase3"),
+        "config_completed": ("phase4_deploy",),
+    }
+    return next((name for name, aliases in groups.items() if stage in aliases), stage)
+
+
 def get_skill_root() -> str:
     script_dir = os.path.dirname(os.path.abspath(__file__))
     return os.path.abspath(os.path.join(script_dir, ".."))
+
+
+def require_run(app_dir: str) -> Dict[str, Any]:
+    """所有运行命令复用同一环境和批次，不从缺失配置猜测环境。"""
+    data = load_json(os.path.join(app_dir, ".build", "run.json"))
+    if not isinstance(data, dict) or any(
+        not isinstance(data.get(key), str) or not data[key].strip()
+        for key in ("runId", "mcpServer")
+    ):
+        raise ValueError("缺少有效 runId 或 mcpServer；新工程须用已选环境 init，历史工程须核对并恢复原 run.json，禁止换批次重放。")
+    return data
+
+
+def unique_task_paths(app_dir: str, tasks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """兼容既有无冲突编号；新冲突按原始身份区分，旧歧义产物不自动迁移。"""
+    groups: Dict[str, List[Dict[str, Any]]] = {}
+    registry = load_json(os.path.join(app_dir, ".build", "dispatch-registry.json")) or {}
+
+    def has_history(task_id: str) -> bool:
+        return task_id in registry or any(os.path.exists(os.path.join(app_dir, ".build", folder, task_id + ".json"))
+                                         for folder in ("receipts", "task-context"))
+
+    for task in tasks:
+        groups.setdefault(task["taskId"], []).append(task)
+    for old_id, group in groups.items():
+        if len(group) > 1 and has_history(old_id):
+            raise ValueError(f"历史任务编号冲突：{old_id}；请先核对对应对象和既有回执，禁止覆盖或重新派发。")
+        identities = set()
+        for task in group:
+            action = task.get("planSlice", {}).get("actionWorkflow", {})
+            identity = json.dumps([task["step"], task["target"].get("type"),
+                                   task["target"].get("name"), action.get("worksheet"), action.get("name")],
+                                  ensure_ascii=False)
+            if identity in identities:
+                raise ValueError(f"重复任务目标：{old_id}；请消除方案中的重复对象。")
+            identities.add(identity)
+            new_id = old_id + "--" + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:12]
+            if len(group) > 1 or has_history(new_id):
+                task["taskId"] = new_id
+                for key in ("receiptPath", "taskContextPath"):
+                    task[key] = os.path.join(os.path.dirname(task[key]), new_id + ".json")
+    for key in ("taskId", "receiptPath", "taskContextPath"):
+        values = [t[key].casefold() for t in tasks]
+        if len(values) != len(set(values)):
+            raise ValueError(f"任务 {key} 存在文件名冲突；未写入任务文件，请先区分目标名称。")
+    return tasks
 
 
 def is_task_succeeded(receipt_path: str, expected_task_id: str, current_run_id: str = "", expected_agent_id: str = "") -> bool:
@@ -96,17 +158,15 @@ def is_task_succeeded(receipt_path: str, expected_task_id: str, current_run_id: 
         return False
 
     receipt_run_id = data.get("runId")
-    if receipt_run_id and current_run_id and receipt_run_id != current_run_id:
+    if not isinstance(current_run_id, str) or not current_run_id.strip() or receipt_run_id != current_run_id:
         return False
 
     executor = data.get("executor", {})
-    if not isinstance(executor, dict) or executor.get("kind") != "subagent":
+    if not isinstance(executor, dict) or executor.get("kind") not in {"subagent", "reconciled"}:
         return False
 
     agent_id = executor.get("agentId")
-    if not agent_id:
-        return False
-    if expected_agent_id and agent_id != expected_agent_id:
+    if not isinstance(agent_id, str) or not agent_id.strip():
         return False
 
     verification = data.get("verification", {})
@@ -117,6 +177,82 @@ def is_task_succeeded(receipt_path: str, expected_task_id: str, current_run_id: 
         return False
 
     return True
+
+
+def receipt_version(receipt_path: str) -> str:
+    """识别派发续作前的旧回执；同内容的新失败回执也按新结果处理。"""
+    with open(receipt_path, "rb") as file_obj:
+        content = file_obj.read()
+        modified = os.fstat(file_obj.fileno()).st_mtime_ns
+    return hashlib.sha256(content + str(modified).encode()).hexdigest()
+
+
+def _group_receipt_missing_worksheets(receipt: Dict[str, Any], expected_target: Optional[Dict[str, Any]]) -> Optional[str]:
+    """校验 Step 2b 分组任务成功回执是否完整覆盖本组全部目标工作表。"""
+    if not isinstance(expected_target, dict) or expected_target.get("type") != "worksheet_group":
+        return None
+    expected_ws = [w for w in (expected_target.get("worksheets") or []) if isinstance(w, str) and w]
+    if not expected_ws:
+        return None
+    outputs = receipt.get("outputs") if isinstance(receipt.get("outputs"), dict) else {}
+    completed_raw = outputs.get("completedWorksheets")
+    done_names = set()
+    if isinstance(completed_raw, list):
+        for item in completed_raw:
+            if isinstance(item, str) and item.strip():
+                done_names.add(item.strip())
+            elif isinstance(item, dict):
+                wn = item.get("worksheetName") or item.get("name")
+                if isinstance(wn, str) and wn.strip():
+                    done_names.add(wn.strip())
+    elif len(expected_ws) == 1:
+        single_name = outputs.get("worksheetName") or outputs.get("name")
+        if isinstance(single_name, str) and single_name.strip() == expected_ws[0]:
+            done_names.add(expected_ws[0])
+    if not done_names:
+        return "分组关联回执缺少 outputs.completedWorksheets 明细；请核实本组各表回填结果。"
+    missing = [w for w in expected_ws if w not in done_names]
+    if missing:
+        return f"分组关联回执未覆盖本组全部目标工作表（缺失：{'、'.join(missing)}）；请补齐剩余工作表。"
+    return None
+
+
+def task_state(
+    receipt_path: str,
+    task_id: str,
+    run_id: str,
+    dispatch: Dict[str, Any],
+    expected_target: Optional[Dict[str, Any]] = None,
+):
+    """回执优先于旧派发状态；不校验外部登记 agentId 字符串相等，避免宿主异步会话 ID 天然不一致导致死锁。"""
+    if not os.path.exists(receipt_path):
+        return dispatch.get("status", "planned"), ""
+    try:
+        receipt = load_json(receipt_path)
+        if (not isinstance(receipt, dict) or receipt.get("runId") != run_id
+                or receipt.get("taskId") != task_id):
+            return "blocked", "回执归属或格式无效；核对原运行与线上结果后恢复或执行 reset-task。"
+        if receipt.get("status") == "succeeded":
+            if is_task_succeeded(receipt_path, task_id, run_id):
+                grp_err = _group_receipt_missing_worksheets(receipt, expected_target)
+                if grp_err:
+                    return "blocked", grp_err
+                return "succeeded", ""
+            return "blocked", "成功回执缺少有效执行者或验证证据；核实结果，不重复创建。"
+        # 续作已派发，保留的旧失败回执不能把新执行器再次放入待派发列表。
+        if (dispatch.get("status") == "running" and dispatch.get("resumeReceiptVersion")
+                == receipt_version(receipt_path)):
+            return "running", ""
+        executor = receipt.get("executor") or {}
+        if (not isinstance(executor, dict) or executor.get("kind") not in {"subagent", "reconciled"}
+                or not isinstance(executor.get("agentId"), str) or not executor.get("agentId").strip()):
+            return "blocked", "回执缺少有效 subagent 执行者标识；先核对实际执行结果。"
+        status = receipt.get("status")
+        if isinstance(status, str) and status in {"failed", "running"}:
+            return status, str(receipt.get("issues") or "")
+        return "blocked", f"任务回执状态为 {status}；核实未完成部分后续作。"
+    except OSError as exc:
+        return "blocked", f"暂无法读取回执：{exc}"
 
 
 def extract_action_workflows(plan: Dict[str, Any], context: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -138,6 +274,7 @@ def extract_action_workflows(plan: Dict[str, Any], context: Dict[str, Any]) -> L
             or act.get("runWorkflowAfterSubmit") is True
             or bool(act.get("intentHints"))
             or bool(act.get("processId"))
+            or bool(act.get("workflowId"))
             or bool(proc_id_by_key.get(comp_key))
         )
         if not is_wf:
@@ -160,7 +297,7 @@ def extract_action_workflows(plan: Dict[str, Any], context: Dict[str, Any]) -> L
             "description": act.get("description", ""),
             "intentHints": act.get("intentHints", []),
             "requirements": act.get("requirements", []),
-            "processId": act.get("processId") or proc_id_by_key.get(comp_key, ""),
+            "processId": act.get("processId") or act.get("workflowId") or proc_id_by_key.get(comp_key, ""),
         })
 
     # 1. 从 worksheets 内嵌 customActions 提取
@@ -192,6 +329,101 @@ def extract_action_workflows(plan: Dict[str, Any], context: Dict[str, Any]) -> L
             add_action_item(ws_name, wf)
 
     return action_wfs
+
+
+MAX_RELATION_GROUP_SIZE = 5
+
+
+def _extract_referenced_worksheets(ws: Dict[str, Any], rel_layout: List[Dict[str, Any]], known_names: set) -> set:
+    refs = set()
+    parent_ws = ws.get("parentWorksheet")
+    if isinstance(parent_ws, str) and parent_ws in known_names:
+        refs.add(parent_ws)
+    for item in rel_layout or []:
+        if isinstance(item, dict):
+            target_ws = item.get("targetWorksheet")
+            if isinstance(target_ws, str) and target_ws in known_names:
+                refs.add(target_ws)
+    for f in (ws.get("fields") or ws.get("customFields") or []):
+        if not isinstance(f, str) or "(" not in f:
+            continue
+        spec = f.split("(", 1)[1].rstrip(")")
+        for prefix in ("Relation:", "SubTable:"):
+            if spec.startswith(prefix):
+                target_name = spec[len(prefix):].split(":", 1)[0].strip()
+                if target_name in known_names:
+                    refs.add(target_name)
+    return refs
+
+
+def group_relation_worksheets(
+    rel_items: List[Dict[str, Any]],
+    all_ws_names: List[str],
+    max_group_size: int = MAX_RELATION_GROUP_SIZE,
+) -> List[List[Dict[str, Any]]]:
+    """按跨表关联连通性（含共同指向同一目标主表）聚拢并按上限保序分箱，消除反向关联并发锁竞争且减少 Subagent 冷启动。"""
+    if not rel_items:
+        return []
+    if len(rel_items) <= max_group_size:
+        return [rel_items]
+
+    known = set(all_ws_names)
+    n = len(rel_items)
+    idx_by_name = {item["name"]: i for i, item in enumerate(rel_items)}
+    parent = list(range(n))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: int, b: int):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            if ra < rb:
+                parent[rb] = ra
+            else:
+                parent[ra] = rb
+
+    holders_by_target: Dict[str, List[int]] = {}
+    for i, item in enumerate(rel_items):
+        for target_name in _extract_referenced_worksheets(item["ws"], item["rel_layout"], known):
+            if target_name in idx_by_name and idx_by_name[target_name] != i:
+                union(i, idx_by_name[target_name])
+            holders_by_target.setdefault(target_name, []).append(i)
+
+    for holders in holders_by_target.values():
+        first = holders[0]
+        for other in holders[1:]:
+            union(first, other)
+
+    comp_map: Dict[int, List[Dict[str, Any]]] = {}
+    comp_order: List[int] = []
+    for i, item in enumerate(rel_items):
+        root = find(i)
+        if root not in comp_map:
+            comp_map[root] = []
+            comp_order.append(root)
+        comp_map[root].append(item)
+
+    atomic_chunks: List[List[Dict[str, Any]]] = []
+    for root in comp_order:
+        comp = comp_map[root]
+        for start in range(0, len(comp), max_group_size):
+            atomic_chunks.append(comp[start : start + max_group_size])
+
+    groups: List[List[Dict[str, Any]]] = []
+    for chunk in atomic_chunks:
+        placed = False
+        for grp in groups:
+            if len(grp) + len(chunk) <= max_group_size:
+                grp.extend(chunk)
+                placed = True
+                break
+        if not placed:
+            groups.append(list(chunk))
+    return groups
 
 
 def get_stage_tasks_definitions(app_dir: str, stage: str) -> List[Dict[str, Any]]:
@@ -284,8 +516,10 @@ def get_stage_tasks_definitions(app_dir: str, stage: str) -> List[Dict[str, Any]
                 "desc": f"创建工作表与基础字段排版: {name}",
             })
 
-    # 阶段 1.5 Pass 2: Step 2b 关联与衍生字段回填
+    # 阶段 1.5 Pass 2: Step 2b 关联与衍生字段按组回填（连通聚类 + 保序分箱，兼容历史单表回执）
     elif stage in ("step2a_done", "step2b"):
+        all_ws_order = [ws.get("name", "") for ws in worksheets if isinstance(ws, dict) and ws.get("name")]
+        pending_rel_items: List[Dict[str, Any]] = []
         for ws in worksheets:
             if not isinstance(ws, dict):
                 continue
@@ -296,7 +530,10 @@ def get_stage_tasks_definitions(app_dir: str, stage: str) -> List[Dict[str, Any]
                 isinstance(f, str) and any(kw in f for kw in ("Relation:", "SubTable:", "Rollup:", "Lookup:"))
                 for f in fields
             )
-            if has_relations:
+            if not has_relations:
+                continue
+            legacy_rel_receipt = f".build/receipts/step2b-rel-{normalize_name(name)}.json"
+            if os.path.exists(os.path.join(app_dir, legacy_rel_receipt)):
                 tasks.append({
                     "taskId": f"step2b-rel-{normalize_name(name)}",
                     "taskName": f"[Step 2b] 关联回填 - {name}",
@@ -305,12 +542,13 @@ def get_stage_tasks_definitions(app_dir: str, stage: str) -> List[Dict[str, Any]
                     "stepFile": "build/steps/2b_create_relations.md",
                     "references": ["references/hap-domain-worksheet-spec.md"],
                     "allowedTools": ["update_worksheet"],
-                    "receiptPath": f".build/receipts/step2b-rel-{normalize_name(name)}.json",
+                    "receiptPath": legacy_rel_receipt,
                     "taskContextPath": f".build/task-context/step2b-rel-{normalize_name(name)}.json",
                     "planSlice": {
                         "worksheetName": name,
                         "fields": fields,
                         "relationLayout": rel_layout or [],
+                        "allWorksheetOrder": all_ws_order,
                         "allRelationLayouts": rel_layout_by_ws,
                         "requirements": ws.get("requirements", []),
                         "appLanguage": app_lang,
@@ -320,10 +558,78 @@ def get_stage_tasks_definitions(app_dir: str, stage: str) -> List[Dict[str, Any]
                         "worksheetId": ws_id_by_name.get(name, ""),
                         "worksheetIdByName": ws_id_by_name,
                         "worksheetFieldsByName": ws_fields_preview,
+                        "fieldOptionsContext": field_options_ctx,
                     },
                     "worksheetContextSlice": {},
                     "desc": f"按预留行号补充跨表关联与衍生字段: {name}",
                 })
+            else:
+                pending_rel_items.append({
+                    "name": name,
+                    "ws": ws,
+                    "fields": fields,
+                    "rel_layout": rel_layout or [],
+                })
+
+        rel_groups = group_relation_worksheets(pending_rel_items, all_ws_order)
+        for idx, grp in enumerate(rel_groups, start=1):
+            group_names = [item["name"] for item in grp]
+            joined_names = "、".join(group_names)
+            plan_slice: Dict[str, Any] = {
+                "groupIndex": idx,
+                "items": [
+                    {
+                        "worksheetName": item["name"],
+                        "worksheetId": ws_id_by_name.get(item["name"], ""),
+                        "worksheet": item["ws"],
+                        "fields": item["fields"],
+                        "relationLayout": item["rel_layout"],
+                        "requirements": item["ws"].get("requirements", []),
+                    }
+                    for item in grp
+                ],
+                "allWorksheetOrder": all_ws_order,
+                "allRelationLayouts": rel_layout_by_ws,
+                "appLanguage": app_lang,
+            }
+            ctx_slice: Dict[str, Any] = {
+                "appId": app_id,
+                "worksheetIds": {item["name"]: ws_id_by_name.get(item["name"], "") for item in grp},
+                "worksheetIdByName": ws_id_by_name,
+                "worksheetFieldsByName": ws_fields_preview,
+                "fieldOptionsContext": field_options_ctx,
+            }
+            if len(grp) == 1:
+                only = grp[0]
+                plan_slice.update({
+                    "worksheet": only["ws"],
+                    "worksheetName": only["name"],
+                    "fields": only["fields"],
+                    "relationLayout": only["rel_layout"],
+                    "requirements": only["ws"].get("requirements", []),
+                })
+                ctx_slice["worksheetId"] = ws_id_by_name.get(only["name"], "")
+
+            tasks.append({
+                "taskId": f"step2b-rel-group-{idx}",
+                "taskName": f"[Step 2b] 关联回填第 {idx} 组 ({joined_names})",
+                "step": "2b",
+                "target": {
+                    "type": "worksheet_group",
+                    "name": f"group-{idx}",
+                    "worksheets": group_names,
+                    "worksheetIds": {n: ws_id_by_name.get(n, "") for n in group_names},
+                },
+                "stepFile": "build/steps/2b_create_relations.md",
+                "references": ["references/hap-domain-worksheet-spec.md"],
+                "allowedTools": ["update_worksheet"],
+                "receiptPath": f".build/receipts/step2b-rel-group-{idx}.json",
+                "taskContextPath": f".build/task-context/step2b-rel-group-{idx}.json",
+                "planSlice": plan_slice,
+                "contextSlice": ctx_slice,
+                "worksheetContextSlice": {},
+                "desc": f"按预留行号逐表顺序补充跨表关联与衍生字段（第 {idx} 组：{joined_names}）",
+            })
 
     # 阶段 2: Step 3 单表全要素 + Step 4a AI 助手实体创建
     elif stage in ("worksheets_created", "phase2_single_table"):
@@ -355,10 +661,12 @@ def get_stage_tasks_definitions(app_dir: str, stage: str) -> List[Dict[str, Any]
                 ],
                 "allowedTools": [
                     "get_worksheet_structure",
+                    "get_custom_action_list",
                     "create_custom_actions",
                     "create_view",
                     "get_view_structure",
                     "update_view",
+                    "get_business_rule_list",
                     "create_business_rule",
                 ],
                 "receiptPath": f".build/receipts/step3-view-act-{normalize_name(name)}.json",
@@ -449,8 +757,43 @@ def get_stage_tasks_definitions(app_dir: str, stage: str) -> List[Dict[str, Any]
                     "desc": f"为 AI 助手 [{b_name}] 配置关联工作流节点并发布",
                 })
 
-        # Step 5: 示例数据（后台任务）
-        tasks.append({
+        # Step 5: 示例数据（后台任务，裁剪只读/分段字段与冗余选项元数据，同时保留关联目标表 dataSource 供外键/主从映射）
+        readonly_types = {
+            "Divider",
+            "AutoNumber",
+            "Concatenate",
+            "Formula",
+            "DateFormula",
+            "FormulaFunc",
+            "FunctionFormula",
+            "Rollup",
+            "Lookup",
+            "SubTable",
+        }
+        slim_ws_ctx = []
+        ws_list_raw = ws_context.get("worksheets", []) if isinstance(ws_context, dict) else (ws_context if isinstance(ws_context, list) else [])
+        for w_item in ws_list_raw:
+            if not isinstance(w_item, dict):
+                continue
+            slim_fields = []
+            for fld in w_item.get("fields", []) or []:
+                if not isinstance(fld, dict) or fld.get("type") in readonly_types:
+                    continue
+                sf: Dict[str, Any] = {"id": fld.get("id"), "name": fld.get("name"), "type": fld.get("type")}
+                if fld.get("alias"):
+                    sf["alias"] = fld["alias"]
+                if fld.get("dataSource"):
+                    sf["dataSource"] = fld["dataSource"]
+                if fld.get("options") and isinstance(fld["options"], list):
+                    sf["options"] = [o.get("value") for o in fld["options"] if isinstance(o, dict) and o.get("value") and not o.get("isDelete")]
+                slim_fields.append(sf)
+            slim_ws_ctx.append({
+                "worksheetId": w_item.get("worksheetId"),
+                "worksheetName": w_item.get("worksheetName"),
+                "fields": slim_fields,
+            })
+
+        step5_task_def = {
             "taskId": "step5-sample-data",
             "taskName": "[Step 5] 填充示例数据",
             "step": "5",
@@ -477,11 +820,11 @@ def get_stage_tasks_definitions(app_dir: str, stage: str) -> List[Dict[str, Any]
             "contextSlice": {
                 "appId": app_id,
                 "worksheetIdByName": ws_id_by_name,
-                "fieldOptionsContext": field_options_ctx,
             },
-            "worksheetContextSlice": ws_context,
+            "worksheetContextSlice": {"worksheets": slim_ws_ctx},
             "desc": "按拓扑顺序批量填报高仿真示例数据",
-        })
+        }
+        tasks.append(step5_task_def)
 
         # Step 6: 自定义页面组装与 summary 布局校正
         for page in custom_pages:
@@ -617,7 +960,69 @@ def get_stage_tasks_definitions(app_dir: str, stage: str) -> List[Dict[str, Any]
                 "desc": f"一体化设计节点、注入预建动作流、校验并发布: {ws_n}/{act_n}",
             })
 
-    return tasks
+        # 若阶段 3 后台任务 Step 5 尚未成功完成（如中途报错中断需 reset-task 重派），在阶段 4 继续挂载追踪
+        step5_receipt = os.path.join(app_dir, ".build", "receipts", "step5-sample-data.json")
+        run_id_cur = (load_json(os.path.join(app_dir, ".build", "run.json")) or {}).get("runId", "")
+        if not is_task_succeeded(step5_receipt, "step5-sample-data", run_id_cur):
+            readonly_types = {"Divider", "AutoNumber", "Concatenate", "Formula", "Rollup", "Lookup", "SubTable"}
+            slim_ws_ctx = []
+            ws_list_raw = ws_context.get("worksheets", []) if isinstance(ws_context, dict) else (ws_context if isinstance(ws_context, list) else [])
+            for w_item in ws_list_raw:
+                if not isinstance(w_item, dict):
+                    continue
+                slim_fields = []
+                for fld in w_item.get("fields", []) or []:
+                    if not isinstance(fld, dict) or fld.get("type") in readonly_types:
+                        continue
+                    sf = {"id": fld.get("id"), "name": fld.get("name"), "type": fld.get("type")}
+                    if fld.get("options") and isinstance(fld["options"], list):
+                        sf["options"] = [o.get("value") for o in fld["options"] if isinstance(o, dict) and o.get("value") and not o.get("isDelete")]
+                    slim_fields.append(sf)
+                slim_ws_ctx.append({
+                    "worksheetId": w_item.get("worksheetId"),
+                    "worksheetName": w_item.get("worksheetName"),
+                    "fields": slim_fields,
+                })
+            tasks.append({
+                "taskId": "step5-sample-data",
+                "taskName": "[Step 5] 填充示例数据",
+                "step": "5",
+                "target": {"type": "sample_data", "name": "全局示例数据"},
+                "stepFile": "build/steps/5_create_sample_data.md",
+                "references": ["references/hap-sample-data-spec.md"],
+                "allowedTools": ["batch_create_records", "get_worksheet_structure"],
+                "receiptPath": ".build/receipts/step5-sample-data.json",
+                "taskContextPath": ".build/task-context/step5-sample-data.json",
+                "isBackground": True,
+                "planSlice": {
+                    "worksheets": [
+                        {
+                            "name": w.get("name"),
+                            "worksheetType": w.get("worksheetType", "normal"),
+                            "parentWorksheet": w.get("parentWorksheet", ""),
+                            "requirements": w.get("requirements", []),
+                        }
+                        for w in worksheets
+                        if isinstance(w, dict)
+                    ],
+                    "appLanguage": app_lang,
+                },
+                "contextSlice": {
+                    "appId": app_id,
+                    "worksheetIdByName": ws_id_by_name,
+                },
+                "worksheetContextSlice": {"worksheets": slim_ws_ctx},
+                "desc": "按拓扑顺序批量填报高仿真示例数据",
+            })
+
+    # 保留目标工作表的完整设计，避免各步骤自行挑字段时丢失后续用途。
+    worksheets_by_name = {w.get("name"): w for w in worksheets if isinstance(w, dict)}
+    for task in tasks:
+        if task["target"].get("type") == "worksheet":
+            worksheet = worksheets_by_name.get(task["target"].get("name"))
+            if worksheet is not None:
+                task["planSlice"]["worksheet"] = worksheet
+    return unique_task_paths(app_dir, tasks)
 
 
 def extract_h2_sections(md_text: str, keywords: List[str]) -> str:
@@ -674,7 +1079,8 @@ def compile_task_bundles(
         f"- **MCP Server**: `{task_ctx_data.get('mcpServer', '')}` | **当前目标 `appId`**: `{app_id_val}`\n"
         f"- **准许工具白名单 (`allowedTools`)**: `{json.dumps(task_ctx_data.get('allowedTools', []), ensure_ascii=False)}`\n"
         f"- **回执落盘路径 (`receiptPath`)**: `{task_ctx_data.get('receiptPath', '')}`\n"
-        f"- **⚠️ Lazy MCP 必读 Schema 与 `appId` 必传铁律**：下方文档中的 `tool(...)` 仅为重点参数简写！通过 `call_mcp_tool` 首次调用任何工具前必须先 `read_file` 读取其 `.json` Schema 核对 `required` 字段；除 `find_member`/`find_department`/`get_current_user` 等组织级接口外，**所有应用内读写工具均须显式传入 `\"appId\": \"{app_id_val}\"`**（若遇 `10001` 或 `401` 报错，立即检查是否漏传 `appId`）。\n\n"
+        f"- **⚠️ 开工先读实时 MCP Schema 与 `appId` 必传铁律**：下方文档仅提供建模与防坑约束（非参数全集），**实时 MCP 工具 Schema 才是平台能力的唯一真值源**！开工构造参数前必须先核对本步目标工具的实时 Schema（Lazy 环境先读 `<toolName>.json`，超长文件截断时续读或精准检索目标类型定义）：只要实时 Schema 支持原生配置（如 `Rollup` 的 `config.relationFilter` 条件汇总），必须优先用原生能力并结合真实表结构主动补全业务口径；除 `find_member`/`find_department`/`get_current_user` 等组织级接口外，**所有应用内读写工具均须显式传入 `\"appId\": \"{app_id_val}\"`**。\n"
+        f"- **⚠️ 完建优先与契约保真铁律（对象完成即成功 · 禁擅自替代规划类型）**：① **不替类型**：规划好的对象与字段/动作类型是下游步骤依赖的契约，绝不能因某项子配置可能不完整就改用其他类型代替（如把汇总改成普通数值字段），否则会导致后续步骤引用受阻，局部受限时保持原类型先落地核心配置；② **不卡后续**：本步核心物理对象创建成功并取得真实 ID（或工作流按规保存 `draft`）即判为 `status: \"succeeded\"`（`passed: true`），平台机制近似（如角色 `20/30` 拥有者范围）或待微调项仅写入 `issues` 供终态总结，严禁超前验收下游阶段或因边界细节标 `failed` 中断搭建！\n\n"
         f"---\n\n## [1] 步骤执行 SOP (`{step_rel}`)\n\n{step_text.strip()}\n\n"
         f"---\n\n## [2] 专属任务上下文数据 (`taskContext`)\n\n```json\n{ctx_json_str}\n```\n"
     ]
@@ -718,7 +1124,7 @@ def compile_task_bundles(
     for i, ch in enumerate(chunks, start=1):
         if total_parts == 1:
             p = os.path.join(bundle_dir, f"{task_id}.md")
-            banner = f"> **[完整单卷 1/1]** 本文件已内联 SOP、专属数据与全部必读规范正文，无需额外读取外部参考文档。\n\n"
+            banner = "> **[完整单卷 1/1]** 本文件已内联 SOP、专属数据与全部必读规范正文，无需额外读取外部参考文档。\n\n"
         else:
             p = os.path.join(bundle_dir, f"{task_id}.part{i}.md")
             banner = f"> **[预编译任务包 分卷 {i}/{total_parts}]** ⚠️ 请务必在同一轮并行 `read_file` 读齐全部 {total_parts} 个分卷后再开始执行！\n\n"
@@ -731,6 +1137,19 @@ def compile_task_bundles(
 
 def cmd_init(app_dir: str, skill_dir: str, mcp_server: str) -> Dict[str, Any]:
     app_dir = os.path.abspath(app_dir)
+    if not isinstance(mcp_server, str) or not mcp_server.strip():
+        raise ValueError("init 必须指定入口已选定的 --mcp-server。")
+    mcp_server = mcp_server.strip()
+    run_path = os.path.join(app_dir, ".build", "run.json")
+    if os.path.exists(run_path):
+        existing = require_run(app_dir)
+        if existing["mcpServer"] != mcp_server:
+            raise ValueError(f"工程环境为 {existing['mcpServer']}，与本次选择不一致；请使用对应工程，不能覆盖原环境。")
+        return {"runId": existing["runId"], "executionMode": "subagent_required",
+                "initialized": False, "reused": True, "buildDir": os.path.dirname(run_path)}
+    build_dir = os.path.dirname(run_path)
+    if os.path.isdir(build_dir) and any(files for _, _, files in os.walk(build_dir)):
+        raise ValueError("已有构建产物但缺少 run.json；请核对并恢复原批次，禁止重新初始化后重复写入。")
     # 若位于 .hap-copilot/ 隐藏工作目录内，自动写入 .gitignore 防止污染宿主仓库
     parts = app_dir.split(os.sep)
     if ".hap-copilot" in parts:
@@ -747,7 +1166,7 @@ def cmd_init(app_dir: str, skill_dir: str, mcp_server: str) -> Dict[str, Any]:
     os.makedirs(os.path.join(build_dir, "receipts"), exist_ok=True)
     os.makedirs(os.path.join(build_dir, "artifacts"), exist_ok=True)
 
-    run_id = f"build-{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    run_id = f"build-{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid4().hex[:12]}"
     run_data = {
         "runId": run_id,
         "appDir": app_dir,
@@ -766,11 +1185,11 @@ def cmd_init(app_dir: str, skill_dir: str, mcp_server: str) -> Dict[str, Any]:
     }
 
 
-def cmd_prepare(app_dir: str, progress: Optional[str], include_pending_capacity: bool = False) -> Dict[str, Any]:
+def cmd_prepare(app_dir: str, progress: Optional[str], include_pending_capacity: bool = True) -> Dict[str, Any]:
     app_dir = os.path.abspath(app_dir)
     skill_root = get_skill_root()
     context = load_json(os.path.join(app_dir, "hap-context.json")) or {}
-    run_data = load_json(os.path.join(app_dir, ".build", "run.json")) or {}
+    run_data = require_run(app_dir)
     run_id = run_data.get("runId", "")
     registry = load_json(os.path.join(app_dir, ".build", "dispatch-registry.json")) or {}
 
@@ -782,14 +1201,40 @@ def cmd_prepare(app_dir: str, progress: Optional[str], include_pending_capacity:
     running_tasks = []
     pending_capacity_tasks = []
     completed_task_ids = []
+    blocked_tasks = []
+    failed_task_ids = []
 
     for t in all_tasks:
         task_id = t["taskId"]
         abs_receipt = os.path.join(app_dir, t["receiptPath"])
+        state, issue = task_state(abs_receipt, task_id, run_id, registry.get(task_id, {}), t.get("target"))
+        if state == "blocked":
+            blocked_tasks.append({"taskId": task_id, "receiptPath": abs_receipt, "reason": issue})
+            continue
+        if state == "succeeded":
+            completed_task_ids.append(task_id)
+            continue
+        if state == "running":
+            running_tasks.append(task_id)
+            continue
+        if state == "failed":
+            failed_task_ids.append(task_id)
+        if state == "pending_capacity":
+            pending_capacity_tasks.append(task_id)
+            if not include_pending_capacity:
+                continue
         abs_task_ctx = os.path.join(app_dir, t["taskContextPath"])
         ref_rel_list = t.get("references") or ([t["primaryRef"]] if t.get("primaryRef") else [])
         abs_refs = [os.path.join(skill_root, r) for r in ref_rel_list]
         allowed_tools = t.get("allowedTools", [])
+        host_adapter = os.path.join(skill_root, "HOST_ADAPTER.md")
+        source_files = {
+            "plan": os.path.join(app_dir, "hap-plan.json"),
+            "context": os.path.join(app_dir, "hap-context.json"),
+            "worksheetContext": os.path.join(app_dir, "worksheetContext.json"),
+            "receipts": os.path.join(app_dir, ".build", "receipts"),
+            "artifacts": os.path.join(app_dir, ".build", "artifacts"),
+        }
 
         task_ctx_data = {
             "taskId": task_id,
@@ -797,8 +1242,10 @@ def cmd_prepare(app_dir: str, progress: Optional[str], include_pending_capacity:
             "runId": run_id,
             "step": t["step"],
             "target": t["target"],
-            "mcpServer": run_data.get("mcpServer", "hap_sandbox_mcp"),
+            "mcpServer": run_data["mcpServer"],
             "stepFile": os.path.join(skill_root, t["stepFile"]),
+            "hostAdapter": host_adapter,
+            "sourceFiles": source_files,
             "references": abs_refs,
             "allowedTools": allowed_tools,
             "receiptPath": abs_receipt,
@@ -806,36 +1253,32 @@ def cmd_prepare(app_dir: str, progress: Optional[str], include_pending_capacity:
             "contextSlice": t.get("contextSlice", {}),
             "worksheetContextSlice": t.get("worksheetContextSlice", {}),
         }
+        if state == "failed" and os.path.exists(abs_receipt):
+            task_ctx_data["previousReceipt"] = load_json(abs_receipt)
         save_json(abs_task_ctx, task_ctx_data)
 
-        expected_agent = registry.get(task_id, {}).get("agentId", "")
-        if is_task_succeeded(abs_receipt, task_id, run_id, expected_agent):
-            completed_task_ids.append(task_id)
-        else:
-            bundle_files = compile_task_bundles(app_dir, skill_root, t, task_ctx_data)
-            task_status = registry.get(task_id, {}).get("status", "planned")
-            ready_entry = {
-                "taskId": task_id,
-                "taskName": t.get("taskName", task_id),
-                "step": t["step"],
-                "stepFile": os.path.join(skill_root, t["stepFile"]),
-                "primaryRef": abs_refs[0] if abs_refs else "",
-                "references": abs_refs,
-                "bundleFiles": bundle_files,
-                "allowedTools": allowed_tools,
-                "taskContext": abs_task_ctx,
-                "receiptPath": abs_receipt,
-                "isBackground": t.get("isBackground", False),
-                "desc": t.get("desc", ""),
-            }
-            if task_status == "running":
-                running_tasks.append(task_id)
-            elif task_status == "pending_capacity":
-                pending_capacity_tasks.append(task_id)
-                if include_pending_capacity:
-                    ready_tasks.append(ready_entry)
-            else:
-                ready_tasks.append(ready_entry)
+        bundle_files = compile_task_bundles(app_dir, skill_root, t, task_ctx_data)
+        ready_entry = {
+            "taskId": task_id,
+            "taskName": t.get("taskName", task_id),
+            "step": t["step"],
+            "stepFile": os.path.join(skill_root, t["stepFile"]),
+            "primaryRef": abs_refs[0] if abs_refs else "",
+            "references": abs_refs,
+            "bundleFiles": bundle_files,
+            "hostAdapter": host_adapter,
+            "sourceFiles": source_files,
+            "allowedTools": allowed_tools,
+            "taskContext": abs_task_ctx,
+            "receiptPath": abs_receipt,
+            "isBackground": t.get("isBackground", False),
+            "desc": t.get("desc", ""),
+            "resume": state == "failed",
+        }
+        ready_tasks.append(ready_entry)
+
+    blocking_ids = [t["taskId"] for t in all_tasks if not t.get("isBackground", False)]
+    can_advance = all(tid in completed_task_ids for tid in blocking_ids)
 
     manifest_data = {
         "stage": stage,
@@ -845,6 +1288,8 @@ def cmd_prepare(app_dir: str, progress: Optional[str], include_pending_capacity:
         "runningCount": len(running_tasks),
         "pendingCapacityCount": len(pending_capacity_tasks),
         "completedCount": len(completed_task_ids),
+        "failedCount": len(failed_task_ids),
+        "blockedCount": len(blocked_tasks),
         "updatedAt": datetime.datetime.now().isoformat(),
     }
     save_json(os.path.join(app_dir, ".build", "task-manifest.json"), manifest_data)
@@ -858,17 +1303,34 @@ def cmd_prepare(app_dir: str, progress: Optional[str], include_pending_capacity:
         "runningTaskCount": len(running_tasks),
         "pendingCapacityCount": len(pending_capacity_tasks),
         "completedCount": len(completed_task_ids),
-        "canAdvance": (len(ready_tasks) == 0 and len(running_tasks) == 0),
+        "failedCount": len(failed_task_ids),
+        "blockedCount": len(blocked_tasks),
+        "failedTaskIds": failed_task_ids,
+        "blockedTasks": blocked_tasks,
+        "canAdvance": can_advance,
         "readyTasks": ready_tasks,
+        "sourceFiles": {
+            "plan": os.path.join(app_dir, "hap-plan.json"),
+            "context": os.path.join(app_dir, "hap-context.json"),
+            "receipts": os.path.join(app_dir, ".build", "receipts"),
+        },
     }
 
 
 def cmd_record_dispatch(app_dir: str, task_id: str, agent_id: str, status: str, reason: str = "") -> Dict[str, Any]:
     app_dir = os.path.abspath(app_dir)
-    run_data = load_json(os.path.join(app_dir, ".build", "run.json")) or {}
+    run_data = require_run(app_dir)
     record_file = os.path.join(app_dir, ".build", "dispatch-registry.json")
     registry = load_json(record_file) or {}
 
+    resume_version = ""
+    receipt_path = os.path.join(app_dir, ".build", "receipts", task_id + ".json")
+    if status == "running":
+        previous_state, _ = task_state(receipt_path, task_id, run_data["runId"], registry.get(task_id, {}))
+        if previous_state == "failed" and registry.get(task_id, {}).get("agentId") and os.path.exists(receipt_path):
+            resume_version = receipt_version(receipt_path)
+        elif previous_state == "running" and registry.get(task_id, {}).get("agentId") == agent_id:
+            resume_version = registry[task_id].get("resumeReceiptVersion", "")
     registry[task_id] = {
         "taskId": task_id,
         "agentId": agent_id,
@@ -877,50 +1339,290 @@ def cmd_record_dispatch(app_dir: str, task_id: str, agent_id: str, status: str, 
         "reason": reason,
         "timestamp": datetime.datetime.now().isoformat(),
     }
+    if resume_version:
+        registry[task_id]["resumeReceiptVersion"] = resume_version
     save_json(record_file, registry)
     return {"taskId": task_id, "status": status, "agentId": agent_id, "recorded": True}
+
+
+def cmd_reset_task(app_dir: str, task_id: str) -> Dict[str, Any]:
+    """核实线上状态后，安全归档损坏/阻塞的异常回执并解除死锁，使该任务重新进入 readyTasks。"""
+    app_dir = os.path.abspath(app_dir)
+    require_run(app_dir)
+    receipt_path = os.path.join(app_dir, ".build", "receipts", task_id + ".json")
+    archived_path = ""
+    if os.path.exists(receipt_path):
+        archive_dir = os.path.join(app_dir, ".build", "archived-receipts")
+        os.makedirs(archive_dir, exist_ok=True)
+        ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        archived_path = os.path.join(archive_dir, f"{task_id}.{ts}.bak")
+        os.replace(receipt_path, archived_path)
+
+    record_file = os.path.join(app_dir, ".build", "dispatch-registry.json")
+    registry = load_json(record_file) or {}
+    if task_id in registry:
+        del registry[task_id]
+        save_json(record_file, registry)
+
+    return {"taskId": task_id, "reset": True, "archivedReceipt": archived_path}
+
+
+def cmd_validate_plan(app_dir: str) -> Dict[str, Any]:
+    """构建前静态检查 hap-plan.json 的主从子表闭环、导航分组覆盖及自定义动作人工输入入口完整性。"""
+    app_dir = os.path.abspath(app_dir)
+    plan_path = os.path.join(app_dir, "hap-plan.json")
+    plan = load_json(plan_path)
+    if not isinstance(plan, dict):
+        raise ValueError(f"未找到合法的 hap-plan.json：{plan_path}")
+
+    errors: List[str] = []
+    warnings: List[str] = []
+
+    worksheets = [w for w in (plan.get("worksheets") or []) if isinstance(w, dict)]
+    ws_by_name = {w.get("name", ""): w for w in worksheets if w.get("name")}
+    nav_groups = set(plan.get("navGroups") or plan.get("sections") or [])
+
+    # 1. 导航分组覆盖检查（子表不独立占顶层导航项，随主表归组）
+    if nav_groups:
+        for obj_kind, items in (
+            ("工作表", [w for w in worksheets if w.get("worksheetType") != "subTable"]),
+            ("自定义页面", [p for p in (plan.get("customPages") or []) if isinstance(p, dict)]),
+            ("AI助手", [b for b in (plan.get("aiAssistants") or plan.get("chatbots") or []) if isinstance(b, dict)]),
+        ):
+            for it in items:
+                grp = it.get("groupName") or it.get("navGroup") or it.get("section") or ""
+                if grp and grp not in nav_groups:
+                    errors.append(f"{obj_kind} [{it.get('name')}] 的分组 [{grp}] 未在顶层 navGroups 中声明。")
+
+    # 2. 主从子表双向挂载闭环检查
+    for ws in worksheets:
+        ws_name = ws.get("name", "")
+        if ws.get("worksheetType") == "subTable":
+            parent_name = ws.get("parentWorksheet", "")
+            parent_ws = ws_by_name.get(parent_name)
+            if not parent_name or not parent_ws:
+                errors.append(f"子表 [{ws_name}] 缺少有效的主表 parentWorksheet（当前：{parent_name or '空'}）。")
+            else:
+                p_fields = [str(f) for f in (parent_ws.get("fields") or parent_ws.get("customFields") or [])]
+                if not any(f"(SubTable:{ws_name})" in f for f in p_fields):
+                    errors.append(f"子表 [{ws_name}] 未在主表 [{parent_name}] 的 fields 中声明 (SubTable:{ws_name}) 挂载字段。")
+
+    # 3. 自定义动作类型与人工输入入口检查（拦截错把需填表操作设为 triggerWorkflow）
+    action_groups: List[Tuple[str, Dict[str, Any]]] = []
+    for ws in worksheets:
+        ws_n = ws.get("name", "")
+        for act in (ws.get("customActions") or ws.get("worksheetCustomActions") or []):
+            if isinstance(act, dict):
+                action_groups.append((ws_n, act))
+    for grp in (plan.get("customActions") or plan.get("worksheetCustomActions") or []):
+        if isinstance(grp, dict):
+            ws_n = grp.get("worksheet", "")
+            for act in (grp.get("actions") or []):
+                if isinstance(act, dict):
+                    action_groups.append((ws_n, act))
+
+    forbidden_approval_btns = {"审批通过", "审批驳回", "审批否决", "同意审批", "拒绝审批"}
+    input_signal_keywords = (
+        "发起借阅", "申请续借", "续借", "登记异常", "登记损坏", "损坏", "遗失", "赔偿", "报修",
+        "填写", "输入", "录入", "选择借阅人", "选择读者", "选择人员", "指派", "指定日期", "应还日期",
+    )
+
+    seen_actions = set()
+    for ws_name, act in action_groups:
+        act_name = str(act.get("name") or act.get("actionName") or "").strip()
+        if not act_name:
+            continue
+        dedup_key = f"{ws_name}::{act_name}"
+        if dedup_key in seen_actions:
+            continue
+        seen_actions.add(dedup_key)
+
+        if act_name in forbidden_approval_btns:
+            errors.append(f"工作表 [{ws_name}] 存在禁用动作按钮 [{act_name}]：审批通过/驳回必须由工作流 approval_block 处理，严禁拆成按钮。")
+
+        act_type = str(act.get("type") or act.get("clickType") or "").strip()
+        if act_type == "createRelatedRecord":
+            target_ws = str(act.get("targetWorksheet") or "").strip()
+            rel_field = str(act.get("relateFieldName") or "").strip()
+            if not target_ws or not rel_field:
+                errors.append(f"动作 [{ws_name}/{act_name}] (createRelatedRecord) 必须同时声明 targetWorksheet 与 relateFieldName。")
+            else:
+                if ws_by_name and target_ws not in ws_by_name:
+                    errors.append(f"动作 [{ws_name}/{act_name}] 的 targetWorksheet [{target_ws}] 在 worksheets 中不存在。")
+                src_ws = ws_by_name.get(ws_name)
+                if src_ws:
+                    s_fields = [str(f) for f in (src_ws.get("fields") or src_ws.get("customFields") or [])]
+                    if not any(f.startswith(f"{rel_field}(Relation:") for f in s_fields):
+                        errors.append(
+                            f"动作 [{ws_name}/{act_name}] 引用的关联字段 [{rel_field}] 未在源表 [{ws_name}] 的 fields 中声明为 Relation 字段。"
+                        )
+
+        needs_wf = (act_type == "triggerWorkflow") or bool(act.get("runWorkflowAfterSubmit"))
+        if needs_wf:
+            hints = act.get("intentHints")
+            if not isinstance(hints, list) or len(hints) == 0:
+                errors.append(f"动作 [{ws_name}/{act_name}] 启用了工作流但缺少非空 intentHints 数组。")
+
+        if act_type == "triggerWorkflow":
+            combined_text = " ".join([
+                act_name,
+                str(act.get("description") or ""),
+                json.dumps(act.get("intentHints") or [], ensure_ascii=False),
+                json.dumps(act.get("requirements") or [], ensure_ascii=False),
+            ])
+            matched_kw = [kw for kw in input_signal_keywords if kw in combined_text]
+            if matched_kw:
+                warnings.append(
+                    f"动作 [{ws_name}/{act_name}] 当前为 triggerWorkflow（无输入表单），但命中疑似需人工输入的语义（{'/'.join(matched_kw[:3])}）："
+                    f"若操作时需现场选择人员、填写日期/金额/原因或异常类型，请改为 createRelatedRecord 或 updateCurrentRecord 并开启 runWorkflowAfterSubmit: true！"
+                )
+
+    return {
+        "passed": len(errors) == 0,
+        "errorCount": len(errors),
+        "warningCount": len(warnings),
+        "errors": errors,
+        "warnings": warnings,
+    }
+
+
+def cmd_resolve_task(app_dir: str, task_id: str, evidence: str, outputs_json: str = "") -> Dict[str, Any]:
+    """当构建中途经跨步骤返工已在线上修复并实测通过后，将原失败/阻塞任务回执正式归并为 succeeded。"""
+    app_dir = os.path.abspath(app_dir)
+    run_data = require_run(app_dir)
+    run_id = run_data["runId"]
+    if not isinstance(evidence, str) or not evidence.strip():
+        raise ValueError("resolve-task 必须提供非空的线上核验依据 --evidence。")
+
+    extra_outputs: Dict[str, Any] = {}
+    if outputs_json and outputs_json.strip():
+        try:
+            parsed = json.loads(outputs_json)
+            if not isinstance(parsed, dict):
+                raise ValueError("outputs-json 必须是 JSON 对象")
+            extra_outputs = parsed
+        except Exception as exc:
+            raise ValueError(f"--outputs-json 不是合法的 JSON 对象：{exc}") from exc
+
+    context = load_json(os.path.join(app_dir, "hap-context.json")) or {}
+    current_stage = context.get("progress", "step1") or "step1"
+    matched_def: Optional[Dict[str, Any]] = None
+    for candidate_stage in (
+        current_stage,
+        "step1",
+        "app_created",
+        "step2a_done",
+        "worksheets_created",
+        "fields_refreshed",
+        "config_completed",
+    ):
+        for t in get_stage_tasks_definitions(app_dir, candidate_stage):
+            if t["taskId"] == task_id:
+                matched_def = t
+                break
+        if matched_def is not None:
+            break
+
+    receipt_rel = matched_def["receiptPath"] if matched_def else os.path.join(".build", "receipts", f"{task_id}.json")
+    receipt_path = os.path.join(app_dir, receipt_rel)
+    previous = load_json(receipt_path)
+    archived_path = ""
+    if os.path.exists(receipt_path):
+        archive_dir = os.path.join(app_dir, ".build", "archived-receipts")
+        os.makedirs(archive_dir, exist_ok=True)
+        ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        archived_path = os.path.join(archive_dir, f"{task_id}.reconciled-{ts}.bak")
+        with open(receipt_path, "rb") as src_f, open(archived_path, "wb") as dst_f:
+            dst_f.write(src_f.read())
+
+    merged_outputs: Dict[str, Any] = {}
+    if isinstance(previous, dict) and isinstance(previous.get("outputs"), dict):
+        merged_outputs.update(previous["outputs"])
+    merged_outputs.update(extra_outputs)
+
+    target_meta = (
+        matched_def["target"]
+        if matched_def
+        else (previous.get("target") if isinstance(previous, dict) and isinstance(previous.get("target"), dict) else {"type": "task", "name": task_id})
+    )
+    step_val = (
+        matched_def["step"]
+        if matched_def
+        else (str(previous.get("step", "")) if isinstance(previous, dict) else "")
+    )
+
+    reconciled_receipt = {
+        "taskId": task_id,
+        "runId": run_id,
+        "executor": {"kind": "reconciled", "agentId": "orchestrator-reconciled"},
+        "step": step_val,
+        "target": target_meta,
+        "status": "succeeded",
+        "outputs": merged_outputs,
+        "verification": {
+            "passed": True,
+            "evidence": [evidence.strip()],
+        },
+        "issues": [],
+    }
+    grp_err = _group_receipt_missing_worksheets(reconciled_receipt, matched_def["target"] if matched_def else None)
+    if grp_err:
+        raise ValueError(grp_err)
+
+    save_json(receipt_path, reconciled_receipt)
+
+    record_file = os.path.join(app_dir, ".build", "dispatch-registry.json")
+    registry = load_json(record_file) or {}
+    registry[task_id] = {
+        "taskId": task_id,
+        "agentId": "orchestrator-reconciled",
+        "runId": run_id,
+        "status": "succeeded",
+        "reason": "reconciled",
+        "timestamp": datetime.datetime.now().isoformat(),
+    }
+    save_json(record_file, registry)
+
+    return {
+        "taskId": task_id,
+        "resolved": True,
+        "receiptPath": receipt_path,
+        "archivedPreviousReceipt": archived_path,
+    }
 
 
 def cmd_refresh(app_dir: str) -> Dict[str, Any]:
     app_dir = os.path.abspath(app_dir)
     context = load_json(os.path.join(app_dir, "hap-context.json")) or {}
-    run_data = load_json(os.path.join(app_dir, ".build", "run.json")) or {}
+    run_data = require_run(app_dir)
     run_id = run_data.get("runId", "")
     stage = context.get("progress", "step1")
 
     all_tasks = get_stage_tasks_definitions(app_dir, stage)
     registry = load_json(os.path.join(app_dir, ".build", "dispatch-registry.json")) or {}
 
-    succeeded = 0
-    running = 0
-    pending_capacity = 0
-    failed = 0
-
+    counts = {"succeeded": 0, "running": 0, "pending_capacity": 0, "failed": 0, "blocked": 0, "planned": 0}
+    succeeded_ids = set()
     for t in all_tasks:
         tid = t["taskId"]
         r_path = os.path.join(app_dir, t["receiptPath"])
-        expected_agent = registry.get(tid, {}).get("agentId", "")
-        if is_task_succeeded(r_path, tid, run_id, expected_agent):
-            succeeded += 1
-        elif tid in registry:
-            st = registry[tid].get("status")
-            if st == "running":
-                running += 1
-            elif st == "pending_capacity":
-                pending_capacity += 1
-            elif st == "failed":
-                failed += 1
-        else:
-            pending_capacity += 1
+        state, _ = task_state(r_path, tid, run_id, registry.get(tid, {}), t.get("target"))
+        counts[state if state in counts else "planned"] += 1
+        if state == "succeeded":
+            succeeded_ids.add(tid)
+
+    blocking_ids = [t["taskId"] for t in all_tasks if not t.get("isBackground", False)]
 
     return {
         "stage": stage,
         "total": len(all_tasks),
-        "succeeded": succeeded,
-        "running": running,
-        "pendingCapacity": pending_capacity,
-        "failed": failed,
-        "phaseComplete": (succeeded == len(all_tasks)),
+        "succeeded": counts["succeeded"],
+        "running": counts["running"],
+        "pendingCapacity": counts["pending_capacity"],
+        "failed": counts["failed"],
+        "blocked": counts["blocked"],
+        "ready": counts["planned"],
+        "phaseComplete": all(tid in succeeded_ids for tid in blocking_ids),
     }
 
 
@@ -928,7 +1630,7 @@ def cmd_finalize(app_dir: str, progress: Optional[str]) -> Dict[str, Any]:
     app_dir = os.path.abspath(app_dir)
     skill_root = get_skill_root()
     context = load_json(os.path.join(app_dir, "hap-context.json")) or {}
-    run_data = load_json(os.path.join(app_dir, ".build", "run.json")) or {}
+    run_data = require_run(app_dir)
     run_id = run_data.get("runId", "")
     registry = load_json(os.path.join(app_dir, ".build", "dispatch-registry.json")) or {}
 
@@ -941,32 +1643,24 @@ def cmd_finalize(app_dir: str, progress: Optional[str]) -> Dict[str, Any]:
     succeeded_tasks = []
     failed_tasks = []
     running_tasks = []
+    pending_capacity_count = 0
     errors = []
 
     for t in all_tasks:
         task_id = t["taskId"]
         r_path = os.path.join(app_dir, t["receiptPath"])
-        if not os.path.exists(r_path):
-            running_tasks.append(task_id)
+        state, issue = task_state(r_path, task_id, run_id, registry.get(task_id, {}), t.get("target"))
+        if state == "succeeded":
+            succeeded_tasks.append(task_id)
+        elif state in {"failed", "blocked"}:
+            failed_tasks.append(task_id)
+            errors.append(f"任务 [{task_id}] {state}: {issue}")
         else:
-            r_data = load_json(r_path)
-            expected_agent = registry.get(task_id, {}).get("agentId", "")
-            if not isinstance(r_data, dict):
-                failed_tasks.append(task_id)
-                errors.append(f"任务 [{task_id}] 回执 JSON 格式损坏")
-            elif r_data.get("status") != "succeeded":
-                failed_tasks.append(task_id)
-                errors.append(f"任务 [{task_id}] 状态为 {r_data.get('status')}: {r_data.get('issues')}")
-            elif not is_task_succeeded(r_path, task_id, run_id, expected_agent):
-                failed_tasks.append(task_id)
-                errors.append(f"任务 [{task_id}] 凭证校验失败 (runId/agentId 不符或缺少验证证据)")
-            else:
-                succeeded_tasks.append(task_id)
+            running_tasks.append(task_id)
+            if state == "pending_capacity":
+                pending_capacity_count += 1
 
-    if stage in ("config_completed", "phase4_deploy"):
-        blocking_tasks = [t["taskId"] for t in all_tasks]
-    else:
-        blocking_tasks = [t["taskId"] for t in all_tasks if not t.get("isBackground", False)]
+    blocking_tasks = [t["taskId"] for t in all_tasks if not t.get("isBackground", False)]
 
     blocking_running = [tid for tid in running_tasks if tid in blocking_tasks]
     blocking_failed = [tid for tid in failed_tasks if tid in blocking_tasks]
@@ -1070,8 +1764,8 @@ def cmd_finalize(app_dir: str, progress: Optional[str]) -> Dict[str, Any]:
             "expected": total_expected,
             "succeeded": len(succeeded_tasks),
             "failed": len(failed_tasks),
-            "running": len(running_tasks),
-            "pendingCapacity": 0,
+            "running": len(running_tasks) - pending_capacity_count,
+            "pendingCapacity": pending_capacity_count,
             "retryPending": 0,
         },
         "execution": {
@@ -1083,6 +1777,7 @@ def cmd_finalize(app_dir: str, progress: Optional[str]) -> Dict[str, Any]:
         "validation": {"passed": can_advance, "errors": errors, "warnings": []},
         "nextProgress": next_progress,
         "canAdvance": can_advance,
+        "nextAction": "advance" if can_advance else "prepare",
         "runningTaskIds": running_tasks,
         "failedTaskIds": failed_tasks,
     }
@@ -1092,10 +1787,16 @@ def cmd_finalize(app_dir: str, progress: Optional[str]) -> Dict[str, Any]:
 
 def cmd_advance(app_dir: str) -> Dict[str, Any]:
     app_dir = os.path.abspath(app_dir)
+    run_data = require_run(app_dir)
     report = load_json(os.path.join(app_dir, ".build", "phase-report.json"))
+    if report and report.get("runId") != run_data["runId"]:
+        raise ValueError("阶段报告不属于当前运行，须重新核验本批次回执，不能直接推进。")
     if not report or not report.get("canAdvance"):
-        print("❌ 推进被阻断: phase-report.json 不存在或 canAdvance 非 true", file=sys.stderr)
-        sys.exit(1)
+        return {
+            "advanced": False,
+            "nextAction": "prepare" if report else "finalize",
+            "reason": "阶段尚未完成；继续核实回执、修复未完成任务并处理无依赖工作。",
+        }
 
     context_path = os.path.join(app_dir, "hap-context.json")
     plan_path = os.path.join(app_dir, "hap-plan.json")
@@ -1104,6 +1805,13 @@ def cmd_advance(app_dir: str) -> Dict[str, Any]:
 
     stage = report.get("phase", "")
     next_progress = report.get("nextProgress", "")
+    if canonical_stage(stage) != canonical_stage(context.get("progress", "")):
+        return {
+            "advanced": False,
+            "nextAction": "finalize",
+            "progress": context.get("progress", ""),
+            "reason": "已保留其他阶段的任务回执；须按当前全局进度重新汇总，不能据此跳过未完成阶段。",
+        }
     all_tasks = get_stage_tasks_definitions(app_dir, stage)
 
     if stage in ("step1", "initial"):
@@ -1175,14 +1883,17 @@ def cmd_advance(app_dir: str) -> Dict[str, Any]:
                         view_id_by_name.setdefault(f"{ws_name}/{v['name']}", v["id"])
             if isinstance(outputs.get("actionIdByName"), dict):
                 action_id_by_name.update(outputs["actionIdByName"])
+            if isinstance(outputs.get("actionProcessIdByKey"), dict):
+                action_proc_by_key.update({k: v for k, v in outputs["actionProcessIdByKey"].items() if v})
             if ws_name and isinstance(outputs.get("actions"), list):
                 for act in outputs["actions"]:
                     if isinstance(act, dict) and act.get("name"):
                         a_name = act["name"]
                         if act.get("id"):
                             action_id_by_name.setdefault(f"{ws_name}/{a_name}", act["id"])
-                        if act.get("processId"):
-                            action_proc_by_key[f"{ws_name}::{a_name}"] = act["processId"]
+                        proc_id = act.get("processId") or act.get("workflowId")
+                        if proc_id:
+                            action_proc_by_key[f"{ws_name}::{a_name}"] = proc_id
             if isinstance(outputs.get("chatbotIdByName"), dict):
                 chatbot_id_by_name.update(outputs["chatbotIdByName"])
             elif outputs.get("chatbotName") and outputs.get("chatbotId"):
@@ -1318,12 +2029,12 @@ def main():
     p_init = subparsers.add_parser("init", help="初始化 .build 运行目录与执行策略")
     p_init.add_argument("--app-dir", type=str, required=True, help="应用项目根目录")
     p_init.add_argument("--skill-dir", type=str, default="", help="Skill 根目录")
-    p_init.add_argument("--mcp-server", type=str, default="hap_sandbox_mcp", help="MCP 服务名")
+    p_init.add_argument("--mcp-server", type=str, required=True, help="入口已选定的 MCP 服务名")
 
-    p_prep = subparsers.add_parser("prepare", help="计算阶段就绪任务并生成切片上下文")
+    p_prep = subparsers.add_parser("prepare", help="准备任务上下文与原始规则、计划入口")
     p_prep.add_argument("--app-dir", type=str, required=True, help="应用项目根目录")
-    p_prep.add_argument("--progress", type=str, default="", help="可选显式指定 progress")
-    p_prep.add_argument("--include-pending-capacity", action="store_true", help="是否包含容量等待任务")
+    p_prep.add_argument("--progress", type=str, default="", help="准备指定阶段候选任务，不改变全局进度；执行前核实实际依赖")
+    p_prep.add_argument("--include-pending-capacity", action="store_true", default=True, help="兼容旧调用；默认已包含容量等待任务")
 
     p_disp = subparsers.add_parser("dispatched", help="记录已成功派发任务")
     p_disp.add_argument("--app-dir", type=str, required=True, help="应用项目根目录")
@@ -1338,6 +2049,19 @@ def main():
     p_df.add_argument("--app-dir", type=str, required=True, help="应用项目根目录")
     p_df.add_argument("--task-id", type=str, required=True, help="任务 ID")
     p_df.add_argument("--reason-code", type=str, default="SUBAGENT_TOOL_ERROR", help="失败原因码")
+
+    p_rst = subparsers.add_parser("reset-task", help="归档异常回执并解除单任务阻塞以便重新派发")
+    p_rst.add_argument("--app-dir", type=str, required=True, help="应用项目根目录")
+    p_rst.add_argument("--task-id", type=str, required=True, help="任务 ID")
+
+    p_rsv = subparsers.add_parser("resolve-task", help="线上返工修复核实后将失败/阻塞任务正式归并为 succeeded 回执")
+    p_rsv.add_argument("--app-dir", type=str, required=True, help="应用项目根目录")
+    p_rsv.add_argument("--task-id", type=str, required=True, help="任务 ID")
+    p_rsv.add_argument("--evidence", type=str, required=True, help="线上核验通过的具体事实依据")
+    p_rsv.add_argument("--outputs-json", type=str, default="", help="可选：补充或覆盖写入 outputs 的 JSON 对象字符串")
+
+    p_val = subparsers.add_parser("validate-plan", help="构建前静态预检 hap-plan.json 结构闭环与自定义动作人工输入入口")
+    p_val.add_argument("--app-dir", type=str, required=True, help="应用项目根目录")
 
     p_ref = subparsers.add_parser("refresh", help="刷新任务状态与进度摘要")
     p_ref.add_argument("--app-dir", type=str, required=True, help="应用项目根目录")
@@ -1365,6 +2089,14 @@ def main():
         res = cmd_record_dispatch(args.app_dir, args.task_id, "", "pending_capacity")
     elif args.command == "dispatch-failed":
         res = cmd_record_dispatch(args.app_dir, args.task_id, "", "failed", args.reason_code)
+    elif args.command == "reset-task":
+        res = cmd_reset_task(args.app_dir, args.task_id)
+    elif args.command == "resolve-task":
+        res = cmd_resolve_task(args.app_dir, args.task_id, args.evidence, args.outputs_json)
+    elif args.command == "validate-plan":
+        res = cmd_validate_plan(args.app_dir)
+        print(json.dumps(res, ensure_ascii=False, indent=2))
+        sys.exit(0 if res["passed"] else 1)
     elif args.command == "refresh":
         res = cmd_refresh(args.app_dir)
     elif args.command == "finalize":
@@ -1377,9 +2109,11 @@ def main():
         res = {"error": f"Unknown command: {args.command}"}
 
     print(json.dumps(res, ensure_ascii=False, indent=2))
-    if args.command == "finalize":
-        sys.exit(0 if res.get("canAdvance") else 1)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except ValueError as exc:
+        print(f"错误：{exc}", file=sys.stderr)
+        sys.exit(2)
