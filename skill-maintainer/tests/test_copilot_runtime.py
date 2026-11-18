@@ -1133,6 +1133,72 @@ class BuildPipelineResilienceTests(Fixture):
         self.assertNotIn('enabled', action)
         self.assertNotIn('createdByBuild', action)
 
+    def test_validate_plan_ignores_negated_input_phrases_on_trigger_workflow(self):
+        self.put('hap-plan.json', {
+            'appName': '个人笔记',
+            'navGroups': ['我的笔记'],
+            'worksheets': [{'name': '笔记', 'groupName': '我的笔记', 'fields': ['标题(Text)']}],
+            'customActions': [{
+                'worksheet': '笔记',
+                'actions': [
+                    {
+                        'name': '归档笔记',
+                        'type': 'triggerWorkflow',
+                        'description': '零人工输入的一键操作，无需现场填写任何表单',
+                        'intentHints': [{'label': '将状态设为已归档'}],
+                        'requirements': ['100% 零人工输入，无需人工选择或录入'],
+                    }
+                ],
+            }],
+        })
+        report = runtime.cmd_validate_plan(str(self.app))
+        self.assertTrue(report['passed'])
+        self.assertEqual(0, report['warningCount'])
+
+    def test_bundle_slimming_avoids_color_54_false_positive_and_slices_step2b(self):
+        self.put('hap-plan.json', {
+            'worksheets': [
+                {'name': '笔记本', 'color': '#3054EB', 'fields': ['名称(Text)', '归属人(Collaborator)']},
+                {'name': '笔记', 'fields': ['标题(Text)', '所属笔记本(Relation:笔记本:single:uni)']},
+            ]
+        })
+        self.put('hap-context.json', {
+            'appId': 'app-1',
+            'progress': 'app_created',
+            'worksheetIdByName': {'笔记本': 'ws-nb', '笔记': 'ws-note'},
+            'relationLayoutByWorksheet': {'笔记': [{'name': '所属笔记本', 'fieldType': 'Relation', 'targetWorksheet': '笔记本'}]},
+        })
+        self.init()
+        s2a_tasks = runtime.cmd_prepare(str(self.app), 'app_created')['readyTasks']
+        nb_task = next(t for t in s2a_tasks if '笔记本' in t['taskName'])
+        nb_bundle = '\n'.join(Path(p).read_text() for p in nb_task['bundleFiles'])
+        self.assertNotIn('必读领域规范全文 (`references/hap-domain-custom-field-spec.md`)', nb_bundle)
+        self.assertNotIn('## 八、 Relation 跨表关联字段规范', nb_bundle)
+
+        s2b_tasks = runtime.cmd_prepare(str(self.app), 'step2a_done')['readyTasks']
+        s2b_bundle = '\n'.join(Path(p).read_text() for p in s2b_tasks[0]['bundleFiles'])
+        self.assertIn('## 八、 Relation 跨表关联字段规范', s2b_bundle)
+        self.assertNotIn('## 十二、 工作表设置与表单体验增强规范', s2b_bundle)
+        self.assertEqual(1, len(s2b_tasks[0]['bundleFiles']))
+
+    def test_finalize_advance_and_prepare_flag_combines_stage_transition(self):
+        self.plan(('笔记本',))
+        run = self.init()
+        task = self.prepare()['readyTasks'][0]
+        r_path = self.receipt(task, run['runId'])
+        data = json.loads(r_path.read_text())
+        data['outputs'] = {'worksheetName': '笔记本', 'worksheetId': 'ws-nb-001', 'fields': [], 'relationLayout': []}
+        r_path.write_text(json.dumps(data, ensure_ascii=False))
+        res = self.cli('build_runtime.py', 'finalize', '--app-dir', str(self.app), '--progress', 'app_created', '--advance-and-prepare')
+        self.assertEqual(0, res.returncode, res.stderr)
+        payload = json.loads(res.stdout)
+        self.assertTrue(payload['canAdvance'])
+        self.assertTrue(payload['advancedResult']['advanced'])
+        self.assertEqual('worksheets_created', payload['advancedResult']['newProgress'])
+        self.assertIn('nextStagePrepare', payload)
+        self.assertEqual(1, len(payload['nextStagePrepare']['readyTasks']))
+        self.assertEqual('3', payload['nextStagePrepare']['readyTasks'][0]['step'])
+
 
 if __name__ == '__main__':
     unittest.main()
