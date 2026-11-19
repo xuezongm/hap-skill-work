@@ -41,7 +41,7 @@ class Fixture(unittest.TestCase):
         return path
 
     def plan(self, names=('订单',)):
-        self.put('hap-plan.json', {'appName': '应用', 'org_id': 'org-a',
+        self.put('hap-plan.json', {'appName': '应用', 'orgId': 'org-a',
                                   'worksheets': [{'name': n, 'fields': []} for n in names]})
         self.put('hap-context.json', {'appId': 'app-a', 'progress': 'app_created'})
 
@@ -913,7 +913,7 @@ class ScanTests(Fixture):
         return json.loads(result.stdout)['apps']
 
     def test_same_name_different_orgs_remain_visible(self):
-        self.put('.hap-copilot/apps/new/hap-plan.json', {'appName': '同名', 'org_id': 'org-a'})
+        self.put('.hap-copilot/apps/new/hap-plan.json', {'appName': '同名', 'orgId': 'org-a'})
         self.put('apps/old/hap-plan.json', {'appName': '同名', 'org_id': 'org-b'})
         self.put('apps/old/hap-context.json', {'appId': 'app-b', 'progress': 'app_created'})
         self.put('apps/old/.build/run.json', {'runId': 'old-run', 'mcpServer': 'other-mcp'})
