@@ -238,25 +238,20 @@ class PackageTests(unittest.TestCase):
         self.assertEqual("", result.stdout)
         self.assertIn("必读规则文件不存在", result.stderr)
 
-    def test_skill_update_check_atomic_upgrade_dirty_guard_and_rollback(self):
+    def test_skill_update_readonly_version_check_cache_and_source_skip(self):
         import json
         import threading
         from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 
         updater = load("skill_update", COPILOT / "scripts/skill_update.py")
-        # 1. 构造 v2.0.1 远端发布包与 manifest.json
-        v2_src = self.parent / "v2_src"
-        shutil.copytree(self.root, v2_src)
-        (v2_src / "version.json").write_text(json.dumps({
-            "name": "hap-app-copilot", "version": "2.0.1", "schemaVersion": 1, "minToolsCount": 170
-        }), encoding="utf-8")
-
         serve_dir = self.parent / "server"
-        api_skills = serve_dir / "api" / "skills"
-        api_skills.mkdir(parents=True, exist_ok=True)
-        packager.package(v2_src, api_skills / "hap-app-copilot.zip", api_skills / "hap-app-copilot.manifest.json")
+        serve_dir.mkdir(parents=True, exist_ok=True)
+        (serve_dir / "version.json").write_text(json.dumps({
+            "name": "hap-mcp-app-builder",
+            "version": "2.1.0",
+            "releaseNotes": "只读版本检查测试",
+        }, ensure_ascii=False), encoding="utf-8")
 
-        # 2. 启动本地测试 HTTP Server
         class QuietHandler(SimpleHTTPRequestHandler):
             def __init__(self, *args, **kwargs):
                 super().__init__(*args, directory=str(serve_dir), **kwargs)
@@ -265,39 +260,36 @@ class PackageTests(unittest.TestCase):
 
         httpd = ThreadingHTTPServer(("127.0.0.1", 0), QuietHandler)
         port = httpd.server_address[1]
-        server_url = f"http://127.0.0.1:{port}"
+        version_url = f"http://127.0.0.1:{port}/version.json"
         thread = threading.Thread(target=httpd.serve_forever, daemon=True)
         thread.start()
         self.addCleanup(httpd.server_close)
         self.addCleanup(httpd.shutdown)
 
-        # 3. 准备初始 v2.0.0 受管理目录并执行 check -> update -> rollback
-        install_entry = self.parent / "skills_host" / "hap-app-copilot"
+        # 1. 独立安装目录应执行只读检查、发现新版并给出升级提示，且绝不修改本地文件
+        install_entry = self.parent / "skills_host" / "hap-mcp-app-builder"
         shutil.copytree(self.root, install_entry)
-        updater.cmd_auto_update(str(install_entry), enable=True, server=server_url, allow_http=True)
+        before_ver = (install_entry / "version.json").read_text(encoding="utf-8")
 
-        chk = updater.cmd_check(str(install_entry), server=server_url, force=True, allow_http=True)
+        chk = updater.cmd_check(str(install_entry), version_url=version_url, force=True, allow_http=True)
         self.assertTrue(chk["checked"])
         self.assertTrue(chk["updateAvailable"])
-        self.assertEqual("2.0.1", chk["remoteVersion"])
+        self.assertEqual("2.1.0", chk["remoteVersion"])
+        self.assertIn("升级 HAP 应用助手", chk["upgradeHint"])
+        self.assertFalse(install_entry.is_symlink())
+        self.assertEqual(before_ver, (install_entry / "version.json").read_text(encoding="utf-8"))
 
-        upd = updater.cmd_update(str(install_entry), server=server_url, allow_http=True)
-        self.assertTrue(upd["updated"])
-        self.assertEqual("2.0.1", upd["version"])
-        self.assertTrue(install_entry.is_symlink())
+        # 2. 第二次无 force 检查命中 24 小时缓存
+        chk_cached = updater.cmd_check(str(install_entry), version_url=version_url, force=False, allow_http=True)
+        self.assertTrue(chk_cached["fromCache"])
+        self.assertTrue(chk_cached["updateAvailable"])
 
-        # 4. 本地修改文件后应触发 Dirty Check 保护
-        (install_entry / "README.md").write_text("user customized", encoding="utf-8")
-        st_dirty = updater.cmd_status(str(install_entry))
-        self.assertTrue(any("README.md" in item for item in st_dirty["dirtyFiles"]))
-        with self.assertRaisesRegex(ValueError, "本地定制修改"):
-            updater.cmd_update(str(install_entry), server=server_url, allow_http=True)
-
-        # 5. 回滚至上一版本 2.0.0 并自动关闭 autoUpdate
-        rb = updater.cmd_rollback(str(install_entry))
-        self.assertTrue(rb["rolledBack"])
-        self.assertEqual("2.0.0", rb["version"])
-        self.assertFalse(rb["autoUpdate"])
+        # 3. 符号链接/源码目录默认跳过检查
+        symlink_entry = self.parent / "skills_host" / "hap-mcp-app-builder-link"
+        symlink_entry.symlink_to(install_entry)
+        chk_skip = updater.cmd_check(str(symlink_entry))
+        self.assertFalse(chk_skip["checked"])
+        self.assertTrue(chk_skip["isSourceWorkspace"])
 
     def test_export_as_hap_mcp_app_builder_and_cleanup_legacy_v1_files(self):
         import json
