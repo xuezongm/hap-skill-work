@@ -1173,7 +1173,7 @@ class BuildPipelineResilienceTests(Fixture):
         nb_task = next(t for t in s2a_tasks if '笔记本' in t['taskName'])
         nb_bundle = '\n'.join(Path(p).read_text() for p in nb_task['bundleFiles'])
         self.assertNotIn('必读领域规范全文 (`references/hap-domain-custom-field-spec.md`)', nb_bundle)
-        self.assertNotIn('## 八、 Relation 跨表关联字段规范', nb_bundle)
+        self.assertIn('## 八、 Relation 跨表关联字段规范', nb_bundle)
 
         s2b_tasks = runtime.cmd_prepare(str(self.app), 'step2a_done')['readyTasks']
         s2b_bundle = '\n'.join(Path(p).read_text() for p in s2b_tasks[0]['bundleFiles'])
